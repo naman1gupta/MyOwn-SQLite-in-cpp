@@ -287,7 +287,8 @@ int main(int argc, char* argv[]) {
         database_file.read(reinterpret_cast<char*>(table_page.data()), table_page.size());
 
         // Count cells (rows) on the leaf table page
-        unsigned short row_count = static_cast<unsigned short>((table_page[100 + 3] << 8) | table_page[100 + 4]);
+        size_t page_header_offset = (rootpage == 1 ? 100 : 0);
+        unsigned short row_count = static_cast<unsigned short>((table_page[page_header_offset + 3] << 8) | table_page[page_header_offset + 4]);
         std::cout << row_count << std::endl;
     }
 
