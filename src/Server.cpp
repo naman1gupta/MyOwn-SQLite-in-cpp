@@ -230,6 +230,31 @@ int main(int argc, char* argv[]) {
         // Table name follows FROM
         std::string table_name = rstrip_semicolon(tokens[from_index + 1]);
 
+        // WHERE clause (simple: col = 'value')
+        bool has_where = false;
+        std::string where_col_upper;
+        std::string where_value;
+        size_t where_index = std::string::npos;
+        for (size_t i = from_index + 2; i < tokens.size(); ++i) {
+            if (to_upper(tokens[i]) == "WHERE") { where_index = i; break; }
+        }
+        if (where_index != std::string::npos && where_index + 3 < tokens.size()) {
+            std::string col_tok = tokens[where_index + 1];
+            // strip quotes/backticks from column token if present
+            if (!col_tok.empty() && (col_tok.front() == '"' || col_tok.front() == '\'' || col_tok.front() == '`')) {
+                if (col_tok.size() >= 2) col_tok = col_tok.substr(1, col_tok.size() - 2);
+            }
+            where_col_upper = to_upper(col_tok);
+            std::string val_tok = rstrip_semicolon(tokens[where_index + 3]);
+            if (!val_tok.empty() && (val_tok.front() == '"' || val_tok.front() == '\'')) {
+                if (val_tok.size() >= 2 && val_tok.back() == val_tok.front()) {
+                    val_tok = val_tok.substr(1, val_tok.size() - 2);
+                }
+            }
+            where_value = val_tok;
+            has_where = true;
+        }
+
         // COUNT(*) special-case: only when single select expression equals COUNT(*)
         bool is_count = (select_cols_upper.size() == 1 && select_cols_upper[0] == "COUNT(*)");
 
@@ -427,6 +452,22 @@ int main(int argc, char* argv[]) {
             for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
 
             size_t body_pos = header_end;
+
+            // WHERE filtering (only equals on text for this stage)
+            if (has_where) {
+                // Determine where column index
+                size_t where_col_idx = std::string::npos;
+                for (size_t k = 0; k < column_names.size(); ++k) {
+                    if (column_names[k] == where_col_upper) { where_col_idx = k; break; }
+                }
+                if (where_col_idx == std::string::npos) continue; // unknown column
+                size_t w_start = body_pos + (where_col_idx < col_offsets.size() ? col_offsets[where_col_idx] : 0);
+                size_t w_len = (where_col_idx < col_lengths.size() ? col_lengths[where_col_idx] : 0);
+                std::string wval;
+                wval.reserve(w_len);
+                for (size_t b = 0; b < w_len; ++b) wval.push_back(static_cast<char>(table_page[w_start + b]));
+                if (wval != where_value) continue; // filter out non-matching rows
+            }
 
             // Output selected columns
             for (size_t j = 0; j < target_col_indices.size(); ++j) {
