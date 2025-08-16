@@ -115,6 +115,180 @@ static std::string decodeValueToString(const std::vector<unsigned char>& buf, si
     }
 }
 
+static bool fetchRowByRowId(std::ifstream& database_file,
+                            unsigned short page_size,
+                            uint32_t page_number,
+                            uint64_t target_rowid,
+                            const std::vector<size_t>& target_col_indices,
+                            ssize_t rowid_alias_index) {
+    std::vector<unsigned char> page(page_size);
+    std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
+    database_file.seekg(offset);
+    database_file.read(reinterpret_cast<char*>(page.data()), page.size());
+    size_t header_offset = (page_number == 1 ? 100 : 0);
+    unsigned char flags = page[header_offset + 0];
+    if (flags == 0x05) {
+        unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
+        size_t cell_ptr_array_offset = header_offset + 12;
+        for (unsigned short i = 0; i < num_cells; ++i) {
+            size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+            unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
+            uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
+            size_t p = cell_offset + 4;
+            auto pr = readVarint(page, p);
+            uint64_t key_rowid = pr.first;
+            if (target_rowid <= key_rowid) return fetchRowByRowId(database_file, page_size, left_child, target_rowid, target_col_indices, rowid_alias_index);
+        }
+        uint32_t right_child = (static_cast<uint32_t>(page[header_offset + 8]) << 24) | (static_cast<uint32_t>(page[header_offset + 9]) << 16) | (static_cast<uint32_t>(page[header_offset + 10]) << 8) | static_cast<uint32_t>(page[header_offset + 11]);
+        return fetchRowByRowId(database_file, page_size, right_child, target_rowid, target_col_indices, rowid_alias_index);
+    } else if (flags != 0x0D) {
+        return false;
+    }
+    unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
+    size_t btree_header_size = 8;
+    size_t cell_ptr_array_offset = header_offset + btree_header_size;
+    for (unsigned short i = 0; i < num_cells; ++i) {
+        size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+        unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
+        size_t p = cell_offset;
+        auto pr = readVarint(page, p);
+        p += pr.second;
+        pr = readVarint(page, p);
+        uint64_t rowid_value = pr.first;
+        p += pr.second;
+        size_t record_start = p;
+        pr = readVarint(page, record_start);
+        uint64_t header_size = pr.first;
+        size_t header_size_len = pr.second;
+        size_t header_varints_pos = record_start + header_size_len;
+        size_t header_end = record_start + static_cast<size_t>(header_size);
+        std::vector<uint64_t> serial_types;
+        size_t hp = header_varints_pos;
+        while (hp < header_end) {
+            auto stp = readVarint(page, hp);
+            serial_types.push_back(stp.first);
+            hp += stp.second;
+        }
+        std::vector<size_t> col_lengths(serial_types.size());
+        for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
+        std::vector<size_t> col_offsets(serial_types.size());
+        size_t acc = 0;
+        for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
+        size_t body_pos = header_end;
+        if (rowid_value == target_rowid) {
+            for (size_t j = 0; j < target_col_indices.size(); ++j) {
+                size_t col_idx = target_col_indices[j];
+                std::string out;
+                if (static_cast<ssize_t>(col_idx) == rowid_alias_index) {
+                    out = std::to_string(static_cast<long long>(rowid_value));
+                } else {
+                    size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
+                    size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
+                    out = decodeValueToString(page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
+                }
+                if (j > 0) std::cout << '|';
+                std::cout << out;
+            }
+            std::cout << std::endl;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void collectRowidsFromIndex(std::ifstream& database_file,
+                                   unsigned short page_size,
+                                   uint32_t page_number,
+                                   size_t index_col_count,
+                                   const std::string& where_value,
+                                   std::vector<uint64_t>& out_rowids) {
+    uint32_t current_page = page_number;
+    while (true) {
+        std::vector<unsigned char> page(page_size);
+        std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(current_page) - 1) * static_cast<uint64_t>(page_size));
+        database_file.seekg(offset);
+        database_file.read(reinterpret_cast<char*>(page.data()), page.size());
+        size_t header_offset = (current_page == 1 ? 100 : 0);
+        unsigned char flags = page[header_offset + 0];
+        if (flags == 0x02) {
+            unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
+            size_t cell_ptr_array_offset = header_offset + 12;
+            bool descended = false;
+            for (unsigned short i = 0; i < num_cells; ++i) {
+                size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+                unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
+                uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
+                size_t p = cell_offset + 4;
+                auto pr = readVarint(page, p);
+                p += pr.second;
+                size_t record_start = p;
+                pr = readVarint(page, record_start);
+                uint64_t header_size = pr.first;
+                size_t header_size_len = pr.second;
+                size_t header_varints_pos = record_start + header_size_len;
+                size_t header_end = record_start + static_cast<size_t>(header_size);
+                std::vector<uint64_t> serial_types;
+                size_t hp = header_varints_pos;
+                while (hp < header_end) { auto t = readVarint(page, hp); serial_types.push_back(t.first); hp += t.second; }
+                size_t body_pos = header_end;
+                size_t first_len = serial_types.empty() ? 0 : serialTypePayloadLength(serial_types[0]);
+                std::string first_val;
+                first_val.reserve(first_len);
+                for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(page[body_pos + j]));
+                if (where_value < first_val) { current_page = left_child; descended = true; break; }
+            }
+            if (!descended) {
+                uint32_t right_child = (static_cast<uint32_t>(page[header_offset + 8]) << 24) | (static_cast<uint32_t>(page[header_offset + 9]) << 16) | (static_cast<uint32_t>(page[header_offset + 10]) << 8) | static_cast<uint32_t>(page[header_offset + 11]);
+                current_page = right_child;
+            }
+            continue;
+        } else if (flags == 0x0A) {
+            unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
+            size_t btree_header_size = 8;
+            size_t cell_ptr_array_offset = header_offset + btree_header_size;
+            for (unsigned short i = 0; i < num_cells; ++i) {
+                size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+                unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
+                size_t p = cell_offset;
+                auto pr = readVarint(page, p);
+                p += pr.second;
+                size_t record_start = p;
+                pr = readVarint(page, record_start);
+                uint64_t header_size = pr.first;
+                size_t header_size_len = pr.second;
+                size_t header_varints_pos = record_start + header_size_len;
+                size_t header_end = record_start + static_cast<size_t>(header_size);
+                std::vector<uint64_t> serial_types;
+                size_t hp = header_varints_pos;
+                while (hp < header_end) { auto t = readVarint(page, hp); serial_types.push_back(t.first); hp += t.second; }
+                std::vector<size_t> col_lengths(serial_types.size());
+                for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
+                std::vector<size_t> col_offsets(serial_types.size());
+                size_t acc = 0;
+                for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
+                size_t body_pos = header_end;
+                size_t first_len = serial_types.empty() ? 0 : col_lengths[0];
+                std::string first_val;
+                first_val.reserve(first_len);
+                for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(page[body_pos + j]));
+                if (first_val == where_value) {
+                    if (serial_types.size() >= index_col_count + 1) {
+                        size_t rowid_col_index = index_col_count;
+                        size_t start = body_pos + col_offsets[rowid_col_index];
+                        size_t len = col_lengths[rowid_col_index];
+                        std::string rowid_str = decodeValueToString(page, start, serial_types[rowid_col_index], len);
+                        uint64_t rowid_value = static_cast<uint64_t>(std::stoll(rowid_str));
+                        out_rowids.push_back(rowid_value);
+                    }
+                }
+            }
+            return;
+        } else {
+            return;
+        }
+    }
+}
+
 static void traverseTableBtree(std::ifstream& database_file,
                                unsigned short page_size,
                                uint32_t page_number,
@@ -386,7 +560,7 @@ int main(int argc, char* argv[]) {
         size_t btree_header_size = (flags == 0x0D) ? 8 : ((flags == 0x05) ? 12 : 8);
         unsigned short num_cells = static_cast<unsigned short>((schema_page[100 + 3] << 8) | schema_page[100 + 4]);
         size_t cell_ptr_array_offset = 100 + btree_header_size;
-        uint64_t rootpage = 0;
+        uint64_t table_rootpage = 0;
         std::string create_sql;
         for (unsigned short i = 0; i < num_cells; ++i) {
             size_t ptr_pos = cell_ptr_array_offset + (i * 2);
@@ -410,24 +584,33 @@ int main(int argc, char* argv[]) {
                 hp += stp.second;
             }
             size_t body_pos = header_end;
+            size_t type_index = 0;
+            size_t name_index = 1;
             size_t tbl_index = 2;
+            size_t root_index = 3;
+            size_t sql_index = 4;
             size_t off = 0;
+            for (size_t col_index = 0; col_index < type_index && col_index < serial_types.size(); ++col_index) off += serialTypePayloadLength(serial_types[col_index]);
+            size_t type_len = serialTypePayloadLength(serial_types.size() > type_index ? serial_types[type_index] : 0);
+            std::string typ;
+            typ.reserve(type_len);
+            size_t type_start = body_pos + off;
+            for (size_t j = 0; j < type_len; ++j) typ.push_back(static_cast<char>(schema_page[type_start + j]));
+            off = 0;
             for (size_t col_index = 0; col_index < tbl_index && col_index < serial_types.size(); ++col_index) off += serialTypePayloadLength(serial_types[col_index]);
             size_t tbl_len = serialTypePayloadLength(serial_types.size() > tbl_index ? serial_types[tbl_index] : 0);
             std::string tbl;
             tbl.reserve(tbl_len);
             size_t tbl_start = body_pos + off;
             for (size_t j = 0; j < tbl_len; ++j) tbl.push_back(static_cast<char>(schema_page[tbl_start + j]));
-            if (tbl == table_name) {
-                size_t root_index = 3;
+            if (to_upper(typ) == "TABLE" && tbl == table_name) {
                 size_t off2 = 0;
                 for (size_t col_index = 0; col_index < root_index && col_index < serial_types.size(); ++col_index) off2 += serialTypePayloadLength(serial_types[col_index]);
                 size_t root_len = serialTypePayloadLength(serial_types.size() > root_index ? serial_types[root_index] : 0);
                 size_t root_start = body_pos + off2;
                 uint64_t root_val = 0;
                 for (size_t j = 0; j < root_len; ++j) root_val = (root_val << 8) | schema_page[root_start + j];
-                rootpage = root_val;
-                size_t sql_index = 4;
+                table_rootpage = root_val;
                 size_t off3 = 0;
                 for (size_t col_index = 0; col_index < sql_index && col_index < serial_types.size(); ++col_index) off3 += serialTypePayloadLength(serial_types[col_index]);
                 size_t sql_len = serialTypePayloadLength(serial_types.size() > sql_index ? serial_types[sql_index] : 0);
@@ -435,19 +618,18 @@ int main(int argc, char* argv[]) {
                 create_sql.clear();
                 create_sql.reserve(sql_len);
                 for (size_t j = 0; j < sql_len; ++j) create_sql.push_back(static_cast<char>(schema_page[sql_start + j]));
-                break;
             }
         }
-        if (rootpage == 0) {
+        if (table_rootpage == 0) {
             if (is_count) { std::cout << 0 << std::endl; } else { std::cout << std::endl; }
             return 0;
         }
         if (is_count) {
             std::vector<unsigned char> table_page(page_size);
-            std::streamoff root_offset = static_cast<std::streamoff>((rootpage - 1) * static_cast<uint64_t>(page_size));
+            std::streamoff root_offset = static_cast<std::streamoff>((table_rootpage - 1) * static_cast<uint64_t>(page_size));
             database_file.seekg(root_offset);
             database_file.read(reinterpret_cast<char*>(table_page.data()), table_page.size());
-            size_t page_header_offset = (rootpage == 1 ? 100 : 0);
+            size_t page_header_offset = (table_rootpage == 1 ? 100 : 0);
             unsigned short row_count = static_cast<unsigned short>((table_page[page_header_offset + 3] << 8) | table_page[page_header_offset + 4]);
             std::cout << row_count << std::endl;
             return 0;
@@ -521,7 +703,145 @@ int main(int argc, char* argv[]) {
                 return 0;
             }
         }
-        traverseTableBtree(database_file, page_size, static_cast<uint32_t>(rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
+        uint64_t index_rootpage = 0;
+        size_t index_col_count = 0;
+        for (unsigned short i = 0; i < num_cells; ++i) {
+            size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+            unsigned short cell_offset = static_cast<unsigned short>((schema_page[ptr_pos] << 8) | schema_page[ptr_pos + 1]);
+            size_t p = cell_offset;
+            auto pr = readVarint(schema_page, p);
+            p += pr.second;
+            pr = readVarint(schema_page, p);
+            p += pr.second;
+            size_t record_start = p;
+            pr = readVarint(schema_page, record_start);
+            uint64_t header_size = pr.first;
+            size_t header_size_len = pr.second;
+            size_t header_varints_pos = record_start + header_size_len;
+            size_t header_end = record_start + static_cast<size_t>(header_size);
+            std::vector<uint64_t> serial_types;
+            size_t hp = header_varints_pos;
+            while (hp < header_end) {
+                auto stp = readVarint(schema_page, hp);
+                serial_types.push_back(stp.first);
+                hp += stp.second;
+            }
+            size_t body_pos = record_start + header_size;
+            size_t type_index = 0;
+            size_t name_index = 1;
+            size_t tbl_index = 2;
+            size_t root_index = 3;
+            size_t sql_index = 4;
+            size_t off0 = 0;
+            for (size_t col_index = 0; col_index < type_index && col_index < serial_types.size(); ++col_index) off0 += serialTypePayloadLength(serial_types[col_index]);
+            size_t type_len = serialTypePayloadLength(serial_types.size() > type_index ? serial_types[type_index] : 0);
+            std::string typ;
+            typ.reserve(type_len);
+            size_t type_start = body_pos + off0;
+            for (size_t j = 0; j < type_len; ++j) typ.push_back(static_cast<char>(schema_page[type_start + j]));
+            off0 = 0;
+            for (size_t col_index = 0; col_index < tbl_index && col_index < serial_types.size(); ++col_index) off0 += serialTypePayloadLength(serial_types[col_index]);
+            size_t tbl_len = serialTypePayloadLength(serial_types.size() > tbl_index ? serial_types[tbl_index] : 0);
+            std::string tbl;
+            tbl.reserve(tbl_len);
+            size_t tbl_start = body_pos + off0;
+            for (size_t j = 0; j < tbl_len; ++j) tbl.push_back(static_cast<char>(schema_page[tbl_start + j]));
+            if (to_upper(typ) == "INDEX" && tbl == table_name) {
+                size_t off3 = 0;
+                for (size_t col_index = 0; col_index < sql_index && col_index < serial_types.size(); ++col_index) off3 += serialTypePayloadLength(serial_types[col_index]);
+                size_t sql_len = serialTypePayloadLength(serial_types.size() > sql_index ? serial_types[sql_index] : 0);
+                size_t sql_start = body_pos + off3;
+                std::string idx_sql;
+                idx_sql.reserve(sql_len);
+                for (size_t j = 0; j < sql_len; ++j) idx_sql.push_back(static_cast<char>(schema_page[sql_start + j]));
+                std::string idx_upper = to_upper(idx_sql);
+                size_t on_pos = idx_upper.find(" ON ");
+                size_t lpar = idx_upper.find('(', on_pos == std::string::npos ? 0 : on_pos);
+                size_t rpar = idx_upper.find(')', lpar == std::string::npos ? 0 : lpar);
+                if (lpar != std::string::npos && rpar != std::string::npos && rpar > lpar) {
+                    std::string cols = idx_upper.substr(lpar + 1, rpar - lpar - 1);
+                    std::vector<std::string> idx_cols;
+                    std::string curc;
+                    for (char c : cols) {
+                        if (c == ',') {
+                            std::string part = trim(curc);
+                            if (!part.empty()) {
+                                size_t sp = part.find_first_of(" \t\r\n");
+                                idx_cols.push_back(trim(sp == std::string::npos ? part : part.substr(0, sp)));
+                            }
+                            curc.clear();
+                        } else {
+                            curc.push_back(c);
+                        }
+                    }
+                    std::string lastc = trim(curc);
+                    if (!lastc.empty()) {
+                        size_t sp = lastc.find_first_of(" \t\r\n");
+                        idx_cols.push_back(trim(sp == std::string::npos ? lastc : lastc.substr(0, sp)));
+                    }
+                    if (!idx_cols.empty() && idx_cols[0] == where_col_upper) {
+                        size_t offr = 0;
+                        for (size_t col_index = 0; col_index < root_index && col_index < serial_types.size(); ++col_index) offr += serialTypePayloadLength(serial_types[col_index]);
+                        size_t root_len = serialTypePayloadLength(serial_types.size() > root_index ? serial_types[root_index] : 0);
+                        size_t root_start = body_pos + offr;
+                        uint64_t root_val = 0;
+                        for (size_t j = 0; j < root_len; ++j) root_val = (root_val << 8) | schema_page[root_start + j];
+                        index_rootpage = root_val;
+                        index_col_count = idx_cols.size();
+                        break;
+                    }
+                }
+            }
+        }
+        if (has_where && index_rootpage != 0) {
+            uint32_t subtree_page = static_cast<uint32_t>(index_rootpage);
+            std::vector<unsigned char> idx_page(page_size);
+            std::streamoff idx_off = static_cast<std::streamoff>((static_cast<uint64_t>(index_rootpage) - 1) * static_cast<uint64_t>(page_size));
+            database_file.seekg(idx_off);
+            database_file.read(reinterpret_cast<char*>(idx_page.data()), idx_page.size());
+            size_t idx_hdr = (index_rootpage == 1 ? 100 : 0);
+            unsigned char iflags = idx_page[idx_hdr + 0];
+            if (iflags == 0x02) {
+                unsigned short inum = static_cast<unsigned short>((idx_page[idx_hdr + 3] << 8) | idx_page[idx_hdr + 4]);
+                size_t iarr = idx_hdr + 12;
+                bool chosen = false;
+                for (unsigned short i = 0; i < inum; ++i) {
+                    size_t iptr = iarr + i * 2;
+                    unsigned short icell = static_cast<unsigned short>((idx_page[iptr] << 8) | idx_page[iptr + 1]);
+                    uint32_t left_child = (static_cast<uint32_t>(idx_page[icell + 0]) << 24) | (static_cast<uint32_t>(idx_page[icell + 1]) << 16) | (static_cast<uint32_t>(idx_page[icell + 2]) << 8) | static_cast<uint32_t>(idx_page[icell + 3]);
+                    size_t p = icell + 4;
+                    auto pr = readVarint(idx_page, p);
+                    uint64_t payload_size = pr.first;
+                    p += pr.second;
+                    size_t rec_start = p;
+                    pr = readVarint(idx_page, rec_start);
+                    uint64_t hsize = pr.first;
+                    size_t hlen = pr.second;
+                    size_t hpos = rec_start + hlen;
+                    size_t hend = rec_start + static_cast<size_t>(hsize);
+                    std::vector<uint64_t> st;
+                    size_t hp = hpos;
+                    while (hp < hend) { auto t = readVarint(idx_page, hp); st.push_back(t.first); hp += t.second; }
+                    size_t bpos = hend;
+                    size_t first_len = st.empty() ? 0 : serialTypePayloadLength(st[0]);
+                    std::string first_val;
+                    first_val.reserve(first_len);
+                    for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(idx_page[bpos + j]));
+                    if (where_value < first_val) { subtree_page = left_child; chosen = true; break; }
+                }
+                if (!chosen) {
+                    subtree_page = (static_cast<uint32_t>(idx_page[idx_hdr + 8]) << 24) | (static_cast<uint32_t>(idx_page[idx_hdr + 9]) << 16) | (static_cast<uint32_t>(idx_page[idx_hdr + 10]) << 8) | static_cast<uint32_t>(idx_page[idx_hdr + 11]);
+                }
+            }
+            std::vector<uint64_t> rowids;
+            rowids.reserve(128);
+            collectRowidsFromIndex(database_file, page_size, subtree_page, index_col_count, where_value, rowids);
+            for (uint64_t rid : rowids) {
+                fetchRowByRowId(database_file, page_size, static_cast<uint32_t>(table_rootpage), rid, target_col_indices, rowid_alias_index);
+            }
+            return 0;
+        }
+        traverseTableBtree(database_file, page_size, static_cast<uint32_t>(table_rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
     }
     return 0;
 }
