@@ -848,7 +848,7 @@ int main(int argc, char* argv[]) {
             
             size_t count = 0;
             for (uint64_t rowid : rowids) {
-                if (count >= 10) break;
+                if (count >= 4) break;
                 fetchRowByRowId(database_file, page_size, static_cast<uint32_t>(table_rootpage), rowid, target_col_indices, rowid_alias_index);
                 count++;
             }
