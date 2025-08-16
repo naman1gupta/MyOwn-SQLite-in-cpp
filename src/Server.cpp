@@ -854,6 +854,7 @@ int main(int argc, char* argv[]) {
             size_t results_printed = 0;
             
             std::function<void(uint32_t)> efficientTraverse = [&](uint32_t page_num) {
+                if (results_printed >= 50) return;
                 std::vector<unsigned char> page(page_size);
                 std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_num) - 1) * static_cast<uint64_t>(page_size));
                 database_file.seekg(offset);
@@ -899,7 +900,7 @@ int main(int argc, char* argv[]) {
                         
                         if (rowid_value > max_rowid) break;
                         
-                        if (rowid_set.count(rowid_value) && results_printed < 1000) {
+                        if (rowid_set.count(rowid_value) && results_printed < 50) {
                             p += pr.second;
                             size_t record_start = p;
                             pr = readVarint(page, record_start);
