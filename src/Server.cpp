@@ -139,8 +139,10 @@ static bool fetchRowByRowId(std::ifstream& database_file,
             size_t cell_ptr_array_offset = header_offset + 12;
             uint32_t target_child = 0;
             
-            for (unsigned short i = 0; i < num_cells; ++i) {
-                size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+            int left = 0, right = num_cells - 1;
+            while (left <= right) {
+                int mid = (left + right) / 2;
+                size_t ptr_pos = cell_ptr_array_offset + (mid * 2);
                 unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
                 uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
                 size_t p = cell_offset + 4;
@@ -148,7 +150,9 @@ static bool fetchRowByRowId(std::ifstream& database_file,
                 uint64_t key_rowid = pr.first;
                 if (target_rowid <= key_rowid) {
                     target_child = left_child;
-                    break;
+                    right = mid - 1;
+                } else {
+                    left = mid + 1;
                 }
             }
             
@@ -252,8 +256,10 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
             size_t cell_ptr_array_offset = header_offset + 12;
             uint32_t target_child = 0;
             
-            for (unsigned short i = 0; i < num_cells; ++i) {
-                size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+            int left = 0, right = num_cells - 1;
+            while (left <= right) {
+                int mid = (left + right) / 2;
+                size_t ptr_pos = cell_ptr_array_offset + (mid * 2);
                 unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
                 uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
                 
@@ -282,9 +288,11 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
                 first_val.resize(first_len);
                 for (size_t j = 0; j < first_len; ++j) first_val[j] = static_cast<char>(page[body_pos + j]);
                 
-                if (where_value < first_val) { 
-                    target_child = left_child; 
-                    break; 
+                if (where_value < first_val) {
+                    target_child = left_child;
+                    right = mid - 1;
+                } else {
+                    left = mid + 1;
                 }
             }
             
