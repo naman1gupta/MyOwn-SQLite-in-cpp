@@ -961,10 +961,11 @@ int main(int argc, char* argv[]) {
             }
             
             std::sort(rowids.begin(), rowids.end());
+            rowids.erase(std::unique(rowids.begin(), rowids.end()), rowids.end());
             
             size_t results_count = 0;
             for (uint64_t rowid : rowids) {
-                if (results_count >= 20) break;
+                if (results_count >= 5) break;
                 
                 std::function<bool(uint32_t)> findAndPrintRow = [&](uint32_t page_num) -> bool {
                     std::vector<unsigned char> table_page(page_size);
