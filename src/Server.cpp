@@ -122,7 +122,8 @@ static void traverseTableBtree(std::ifstream& database_file,
                                const std::vector<size_t>& target_col_indices,
                                bool has_where,
                                size_t where_col_idx,
-                               const std::string& where_value) {
+                               const std::string& where_value,
+                               ssize_t rowid_alias_index) {
     std::vector<unsigned char> page(page_size);
     std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
     database_file.seekg(offset);
@@ -136,10 +137,10 @@ static void traverseTableBtree(std::ifstream& database_file,
             size_t ptr_pos = cell_ptr_array_offset + (i * 2);
             unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
             uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
-            traverseTableBtree(database_file, page_size, left_child, column_names, target_col_indices, has_where, where_col_idx, where_value);
+            traverseTableBtree(database_file, page_size, left_child, column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
         }
         uint32_t right_child = (static_cast<uint32_t>(page[header_offset + 8]) << 24) | (static_cast<uint32_t>(page[header_offset + 9]) << 16) | (static_cast<uint32_t>(page[header_offset + 10]) << 8) | static_cast<uint32_t>(page[header_offset + 11]);
-        traverseTableBtree(database_file, page_size, right_child, column_names, target_col_indices, has_where, where_col_idx, where_value);
+        traverseTableBtree(database_file, page_size, right_child, column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
         return;
     } else if (flags != 0x0D) {
         return;
@@ -155,6 +156,7 @@ static void traverseTableBtree(std::ifstream& database_file,
         uint64_t payload_size = pr.first;
         p += pr.second;
         pr = readVarint(page, p);
+        uint64_t rowid_value = pr.first;
         p += pr.second;
         size_t record_start = p;
         pr = readVarint(page, record_start);
@@ -176,17 +178,27 @@ static void traverseTableBtree(std::ifstream& database_file,
         for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
         size_t body_pos = header_end;
         if (has_where) {
-            if (where_col_idx >= col_offsets.size()) continue;
-            size_t w_start = body_pos + col_offsets[where_col_idx];
-            size_t w_len = col_lengths[where_col_idx];
-            std::string wval = decodeValueToString(page, w_start, serial_types[where_col_idx], w_len);
-            if (wval != where_value) continue;
+            if (where_col_idx == static_cast<size_t>(rowid_alias_index)) {
+                std::string wval = std::to_string(static_cast<long long>(rowid_value));
+                if (wval != where_value) continue;
+            } else {
+                if (where_col_idx >= col_offsets.size()) continue;
+                size_t w_start = body_pos + col_offsets[where_col_idx];
+                size_t w_len = col_lengths[where_col_idx];
+                std::string wval = decodeValueToString(page, w_start, serial_types[where_col_idx], w_len);
+                if (wval != where_value) continue;
+            }
         }
         for (size_t j = 0; j < target_col_indices.size(); ++j) {
             size_t col_idx = target_col_indices[j];
-            size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
-            size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
-            std::string out = decodeValueToString(page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
+            std::string out;
+            if (static_cast<ssize_t>(col_idx) == rowid_alias_index) {
+                out = std::to_string(static_cast<long long>(rowid_value));
+            } else {
+                size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
+                size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
+                out = decodeValueToString(page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
+            }
             if (j > 0) std::cout << '|';
             std::cout << out;
         }
@@ -332,22 +344,28 @@ int main(int argc, char* argv[]) {
         bool has_where = false;
         std::string where_col_upper;
         std::string where_value;
-        size_t where_index = std::string::npos;
-        for (size_t i = from_index + 2; i < tokens.size(); ++i) {
-            if (to_upper(tokens[i]) == "WHERE") { where_index = i; break; }
-        }
-        if (where_index != std::string::npos && where_index + 3 < tokens.size()) {
-            std::string col_tok = tokens[where_index + 1];
-            if (!col_tok.empty() && (col_tok.front() == '"' || col_tok.front() == '\'' || col_tok.front() == '`')) {
-                if (col_tok.size() >= 2) col_tok = col_tok.substr(1, col_tok.size() - 2);
+        size_t where_pos_ci = to_upper(command).find("WHERE");
+        if (where_pos_ci != std::string::npos) {
+            size_t i2 = where_pos_ci + 5;
+            while (i2 < command.size() && std::isspace(static_cast<unsigned char>(command[i2]))) ++i2;
+            size_t col_start = i2;
+            while (i2 < command.size() && command[i2] != '=' && !std::isspace(static_cast<unsigned char>(command[i2]))) ++i2;
+            std::string col_tok = command.substr(col_start, i2 - col_start);
+            while (i2 < command.size() && std::isspace(static_cast<unsigned char>(command[i2]))) ++i2;
+            if (i2 < command.size() && command[i2] == '=') ++i2;
+            while (i2 < command.size() && std::isspace(static_cast<unsigned char>(command[i2]))) ++i2;
+            std::string val_tok;
+            if (i2 < command.size() && (command[i2] == '\'' || command[i2] == '"')) {
+                char q = command[i2++];
+                size_t start = i2;
+                while (i2 < command.size() && command[i2] != q) ++i2;
+                val_tok = command.substr(start, i2 - start);
+            } else {
+                size_t start = i2;
+                while (i2 < command.size() && !std::isspace(static_cast<unsigned char>(command[i2])) && command[i2] != ';') ++i2;
+                val_tok = command.substr(start, i2 - start);
             }
             where_col_upper = to_upper(col_tok);
-            std::string val_tok = rstrip_semicolon(tokens[where_index + 3]);
-            if (!val_tok.empty() && (val_tok.front() == '"' || val_tok.front() == '\'')) {
-                if (val_tok.size() >= 2 && val_tok.back() == val_tok.front()) {
-                    val_tok = val_tok.substr(1, val_tok.size() - 2);
-                }
-            }
             where_value = val_tok;
             has_where = true;
         }
@@ -435,6 +453,7 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         std::vector<std::string> column_names;
+        std::vector<std::string> column_defs_upper;
         {
             std::string sql = create_sql;
             size_t lpar = sql.find('(');
@@ -451,6 +470,7 @@ int main(int argc, char* argv[]) {
                         if (!part.empty()) {
                             size_t sp = part.find_first_of(" \t\r\n");
                             column_names.push_back(to_upper(trim(sp == std::string::npos ? part : part.substr(0, sp))));
+                            column_defs_upper.push_back(to_upper(part));
                         }
                         cur.clear();
                     } else {
@@ -461,7 +481,16 @@ int main(int argc, char* argv[]) {
                 if (!last.empty()) {
                     size_t sp = last.find_first_of(" \t\r\n");
                     column_names.push_back(to_upper(trim(sp == std::string::npos ? last : last.substr(0, sp))));
+                    column_defs_upper.push_back(to_upper(last));
                 }
+            }
+        }
+        ssize_t rowid_alias_index = -1;
+        for (size_t i = 0; i < column_defs_upper.size(); ++i) {
+            const std::string& def = column_defs_upper[i];
+            if (def.find("PRIMARY KEY") != std::string::npos && (def.find("INTEGER") != std::string::npos || def.find(" INT") != std::string::npos)) {
+                rowid_alias_index = static_cast<ssize_t>(i);
+                break;
             }
         }
         std::vector<size_t> target_col_indices;
@@ -492,7 +521,7 @@ int main(int argc, char* argv[]) {
                 return 0;
             }
         }
-        traverseTableBtree(database_file, page_size, static_cast<uint32_t>(rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value);
+        traverseTableBtree(database_file, page_size, static_cast<uint32_t>(rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
     }
     return 0;
 }
