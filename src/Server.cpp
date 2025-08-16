@@ -71,34 +71,151 @@ static std::string trim(const std::string& s) {
     return s.substr(b, e - b);
 }
 
+static int64_t readBigEndianSigned(const unsigned char* bytes, size_t len) {
+    int64_t value = 0;
+    for (size_t i = 0; i < len; ++i) {
+        value = (value << 8) | bytes[i];
+    }
+    size_t total_bits = len * 8;
+    if (len > 0 && (bytes[0] & 0x80u)) {
+        if (total_bits < 64) {
+            int64_t mask = -1;
+            mask <<= total_bits;
+            value |= mask;
+        }
+    }
+    return value;
+}
+
+static std::string decodeValueToString(const std::vector<unsigned char>& buf, size_t start, uint64_t serial_type_code, size_t len) {
+    switch (serial_type_code) {
+        case 0: return "";
+        case 1: return std::to_string(readBigEndianSigned(&buf[start], 1));
+        case 2: return std::to_string(readBigEndianSigned(&buf[start], 2));
+        case 3: return std::to_string(readBigEndianSigned(&buf[start], 3));
+        case 4: return std::to_string(readBigEndianSigned(&buf[start], 4));
+        case 5: return std::to_string(readBigEndianSigned(&buf[start], 6));
+        case 6: return std::to_string(readBigEndianSigned(&buf[start], 8));
+        case 7: {
+            uint64_t u = 0;
+            for (size_t i = 0; i < 8; ++i) u = (u << 8) | buf[start + i];
+            double d;
+            std::memcpy(&d, &u, sizeof(double));
+            return std::to_string(d);
+        }
+        case 8: return "0";
+        case 9: return "1";
+        default: {
+            if (serial_type_code >= 12 && (serial_type_code % 2) == 1) {
+                return std::string(reinterpret_cast<const char*>(&buf[start]), len);
+            } else {
+                return std::string(reinterpret_cast<const char*>(&buf[start]), len);
+            }
+        }
+    }
+}
+
+static void traverseTableBtree(std::ifstream& database_file,
+                               unsigned short page_size,
+                               uint32_t page_number,
+                               const std::vector<std::string>& column_names,
+                               const std::vector<size_t>& target_col_indices,
+                               bool has_where,
+                               size_t where_col_idx,
+                               const std::string& where_value) {
+    std::vector<unsigned char> page(page_size);
+    std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
+    database_file.seekg(offset);
+    database_file.read(reinterpret_cast<char*>(page.data()), page.size());
+    size_t header_offset = (page_number == 1 ? 100 : 0);
+    unsigned char flags = page[header_offset + 0];
+    if (flags == 0x05) {
+        unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
+        size_t cell_ptr_array_offset = header_offset + 12;
+        for (unsigned short i = 0; i < num_cells; ++i) {
+            size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+            unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
+            uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
+            traverseTableBtree(database_file, page_size, left_child, column_names, target_col_indices, has_where, where_col_idx, where_value);
+        }
+        uint32_t right_child = (static_cast<uint32_t>(page[header_offset + 8]) << 24) | (static_cast<uint32_t>(page[header_offset + 9]) << 16) | (static_cast<uint32_t>(page[header_offset + 10]) << 8) | static_cast<uint32_t>(page[header_offset + 11]);
+        traverseTableBtree(database_file, page_size, right_child, column_names, target_col_indices, has_where, where_col_idx, where_value);
+        return;
+    } else if (flags != 0x0D) {
+        return;
+    }
+    unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
+    size_t btree_header_size = 8;
+    size_t cell_ptr_array_offset = header_offset + btree_header_size;
+    for (unsigned short i = 0; i < num_cells; ++i) {
+        size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+        unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
+        size_t p = cell_offset;
+        auto pr = readVarint(page, p);
+        uint64_t payload_size = pr.first;
+        p += pr.second;
+        pr = readVarint(page, p);
+        p += pr.second;
+        size_t record_start = p;
+        pr = readVarint(page, record_start);
+        uint64_t header_size = pr.first;
+        size_t header_size_len = pr.second;
+        size_t header_varints_pos = record_start + header_size_len;
+        size_t header_end = record_start + static_cast<size_t>(header_size);
+        std::vector<uint64_t> serial_types;
+        size_t hp = header_varints_pos;
+        while (hp < header_end) {
+            auto stp = readVarint(page, hp);
+            serial_types.push_back(stp.first);
+            hp += stp.second;
+        }
+        std::vector<size_t> col_lengths(serial_types.size());
+        for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
+        std::vector<size_t> col_offsets(serial_types.size());
+        size_t acc = 0;
+        for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
+        size_t body_pos = header_end;
+        if (has_where) {
+            if (where_col_idx >= col_offsets.size()) continue;
+            size_t w_start = body_pos + col_offsets[where_col_idx];
+            size_t w_len = col_lengths[where_col_idx];
+            std::string wval = decodeValueToString(page, w_start, serial_types[where_col_idx], w_len);
+            if (wval != where_value) continue;
+        }
+        for (size_t j = 0; j < target_col_indices.size(); ++j) {
+            size_t col_idx = target_col_indices[j];
+            size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
+            size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
+            std::string out = decodeValueToString(page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
+            if (j > 0) std::cout << '|';
+            std::cout << out;
+        }
+        std::cout << std::endl;
+    }
+}
+
 int main(int argc, char* argv[]) {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
-
     std::cerr << "Logs from your program will appear here" << std::endl;
-
     if (argc != 3) {
         std::cerr << "Expected two arguments" << std::endl;
         return 1;
     }
-
     std::string database_file_path = argv[1];
     std::string command = argv[2];
     std::string command_upper = to_upper(command);
-
     if (command == ".dbinfo") {
         std::ifstream database_file(database_file_path, std::ios::binary);
         if (!database_file) {
             std::cerr << "Failed to open the database file" << std::endl;
             return 1;
         }
-
         database_file.seekg(16);
         char buffer[2];
         database_file.read(buffer, 2);
         unsigned short page_size = (static_cast<unsigned char>(buffer[1]) | (static_cast<unsigned char>(buffer[0]) << 8));
         std::cout << "database page size: " << page_size << std::endl;
-
         database_file.seekg(100 + 3);
         char cell_count_bytes[2];
         database_file.read(cell_count_bytes, 2);
@@ -111,47 +228,40 @@ int main(int argc, char* argv[]) {
             std::cerr << "Failed to open the database file" << std::endl;
             return 1;
         }
-
         database_file.seekg(16);
         char ps_bytes[2];
         database_file.read(ps_bytes, 2);
         unsigned short page_size = (static_cast<unsigned char>(ps_bytes[1]) | (static_cast<unsigned char>(ps_bytes[0]) << 8));
-
         database_file.seekg(0);
         std::vector<unsigned char> page(page_size);
         database_file.read(reinterpret_cast<char*>(page.data()), page.size());
-
         unsigned char flags = page[100];
         size_t btree_header_size = (flags == 0x0D) ? 8 : ((flags == 0x05) ? 12 : 8);
         unsigned short num_cells = static_cast<unsigned short>((page[100 + 3] << 8) | page[100 + 4]);
         size_t cell_ptr_array_offset = 100 + btree_header_size;
-
         std::vector<std::string> table_names;
         table_names.reserve(num_cells);
-
         for (unsigned short i = 0; i < num_cells; ++i) {
             size_t ptr_pos = cell_ptr_array_offset + (i * 2);
             unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
-
             size_t p = cell_offset;
-            auto [payload_size, payload_size_len] = readVarint(page, p);
-            p += payload_size_len;
-            auto [_, rowid_len] = readVarint(page, p);
-            p += rowid_len;
-
+            auto pr = readVarint(page, p);
+            p += pr.second;
+            pr = readVarint(page, p);
+            p += pr.second;
             size_t record_start = p;
-            auto [header_size, header_size_len] = readVarint(page, record_start);
+            pr = readVarint(page, record_start);
+            uint64_t header_size = pr.first;
+            size_t header_size_len = pr.second;
             size_t header_varints_pos = record_start + header_size_len;
             size_t header_end = record_start + static_cast<size_t>(header_size);
-
             std::vector<uint64_t> serial_types;
             size_t hp = header_varints_pos;
             while (hp < header_end) {
-                auto [st, st_len] = readVarint(page, hp);
-                serial_types.push_back(st);
-                hp += st_len;
+                auto stp = readVarint(page, hp);
+                serial_types.push_back(stp.first);
+                hp += stp.second;
             }
-
             size_t body_pos = header_end;
             size_t target_index = 2;
             size_t body_offset = 0;
@@ -160,24 +270,20 @@ int main(int argc, char* argv[]) {
             }
             uint64_t tbl_name_serial_type = (target_index < serial_types.size()) ? serial_types[target_index] : 0;
             size_t tbl_name_len = serialTypePayloadLength(tbl_name_serial_type);
-
             std::string tbl_name;
             tbl_name.reserve(tbl_name_len);
             size_t tbl_name_start = body_pos + body_offset;
             for (size_t j = 0; j < tbl_name_len; ++j) {
                 tbl_name.push_back(static_cast<char>(page[tbl_name_start + j]));
             }
-
             table_names.push_back(tbl_name);
         }
-
         for (size_t i = 0; i < table_names.size(); ++i) {
             if (i > 0) std::cout << " ";
             std::cout << table_names[i];
         }
         std::cout << std::endl;
     } else if (command_upper.rfind("SELECT", 0) == 0) {
-        // Tokenize
         std::vector<std::string> tokens;
         {
             std::string cur;
@@ -194,7 +300,6 @@ int main(int argc, char* argv[]) {
             std::cout << std::endl;
             return 0;
         }
-        // Find FROM token position
         size_t from_index = std::string::npos;
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (to_upper(tokens[i]) == "FROM") { from_index = i; break; }
@@ -203,14 +308,11 @@ int main(int argc, char* argv[]) {
             std::cout << std::endl;
             return 0;
         }
-
-        // Build select list string (tokens between SELECT and FROM), then split by ','
         std::string select_list_str;
         for (size_t i = 1; i < from_index; ++i) {
             if (!select_list_str.empty()) select_list_str.push_back(' ');
             select_list_str += tokens[i];
         }
-        // Split by comma
         std::vector<std::string> select_cols_upper;
         {
             std::string cur;
@@ -226,11 +328,7 @@ int main(int argc, char* argv[]) {
             std::string last = trim(cur);
             if (!last.empty()) select_cols_upper.push_back(to_upper(last));
         }
-
-        // Table name follows FROM
         std::string table_name = rstrip_semicolon(tokens[from_index + 1]);
-
-        // WHERE clause (simple: col = 'value')
         bool has_where = false;
         std::string where_col_upper;
         std::string where_value;
@@ -240,7 +338,6 @@ int main(int argc, char* argv[]) {
         }
         if (where_index != std::string::npos && where_index + 3 < tokens.size()) {
             std::string col_tok = tokens[where_index + 1];
-            // strip quotes/backticks from column token if present
             if (!col_tok.empty() && (col_tok.front() == '"' || col_tok.front() == '\'' || col_tok.front() == '`')) {
                 if (col_tok.size() >= 2) col_tok = col_tok.substr(1, col_tok.size() - 2);
             }
@@ -254,58 +351,47 @@ int main(int argc, char* argv[]) {
             where_value = val_tok;
             has_where = true;
         }
-
-        // COUNT(*) special-case: only when single select expression equals COUNT(*)
         bool is_count = (select_cols_upper.size() == 1 && select_cols_upper[0] == "COUNT(*)");
-
         std::ifstream database_file(database_file_path, std::ios::binary);
         if (!database_file) {
             std::cerr << "Failed to open the database file" << std::endl;
             return 1;
         }
-
         database_file.seekg(16);
         char ps_bytes[2];
         database_file.read(ps_bytes, 2);
         unsigned short page_size = (static_cast<unsigned char>(ps_bytes[1]) | (static_cast<unsigned char>(ps_bytes[0]) << 8));
-
         database_file.seekg(0);
         std::vector<unsigned char> schema_page(page_size);
         database_file.read(reinterpret_cast<char*>(schema_page.data()), schema_page.size());
-
         unsigned char flags = schema_page[100];
         size_t btree_header_size = (flags == 0x0D) ? 8 : ((flags == 0x05) ? 12 : 8);
         unsigned short num_cells = static_cast<unsigned short>((schema_page[100 + 3] << 8) | schema_page[100 + 4]);
         size_t cell_ptr_array_offset = 100 + btree_header_size;
-
         uint64_t rootpage = 0;
         std::string create_sql;
         for (unsigned short i = 0; i < num_cells; ++i) {
             size_t ptr_pos = cell_ptr_array_offset + (i * 2);
             unsigned short cell_offset = static_cast<unsigned short>((schema_page[ptr_pos] << 8) | schema_page[ptr_pos + 1]);
-
             size_t p = cell_offset;
-            auto [payload_size, payload_size_len] = readVarint(schema_page, p);
-            p += payload_size_len;
-            auto [_, rowid_len] = readVarint(schema_page, p);
-            p += rowid_len;
-
+            auto pr = readVarint(schema_page, p);
+            p += pr.second;
+            pr = readVarint(schema_page, p);
+            p += pr.second;
             size_t record_start = p;
-            auto [header_size, header_size_len] = readVarint(schema_page, record_start);
+            pr = readVarint(schema_page, record_start);
+            uint64_t header_size = pr.first;
+            size_t header_size_len = pr.second;
             size_t header_varints_pos = record_start + header_size_len;
             size_t header_end = record_start + static_cast<size_t>(header_size);
-
             std::vector<uint64_t> serial_types;
             size_t hp = header_varints_pos;
             while (hp < header_end) {
-                auto [st, st_len] = readVarint(schema_page, hp);
-                serial_types.push_back(st);
-                hp += st_len;
+                auto stp = readVarint(schema_page, hp);
+                serial_types.push_back(stp.first);
+                hp += stp.second;
             }
-
             size_t body_pos = header_end;
-
-            // Extract tbl_name (index 2) and compare
             size_t tbl_index = 2;
             size_t off = 0;
             for (size_t col_index = 0; col_index < tbl_index && col_index < serial_types.size(); ++col_index) off += serialTypePayloadLength(serial_types[col_index]);
@@ -314,9 +400,7 @@ int main(int argc, char* argv[]) {
             tbl.reserve(tbl_len);
             size_t tbl_start = body_pos + off;
             for (size_t j = 0; j < tbl_len; ++j) tbl.push_back(static_cast<char>(schema_page[tbl_start + j]));
-
             if (tbl == table_name) {
-                // rootpage at index 3
                 size_t root_index = 3;
                 size_t off2 = 0;
                 for (size_t col_index = 0; col_index < root_index && col_index < serial_types.size(); ++col_index) off2 += serialTypePayloadLength(serial_types[col_index]);
@@ -325,8 +409,6 @@ int main(int argc, char* argv[]) {
                 uint64_t root_val = 0;
                 for (size_t j = 0; j < root_len; ++j) root_val = (root_val << 8) | schema_page[root_start + j];
                 rootpage = root_val;
-
-                // sql at index 4
                 size_t sql_index = 4;
                 size_t off3 = 0;
                 for (size_t col_index = 0; col_index < sql_index && col_index < serial_types.size(); ++col_index) off3 += serialTypePayloadLength(serial_types[col_index]);
@@ -338,12 +420,10 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
-
         if (rootpage == 0) {
             if (is_count) { std::cout << 0 << std::endl; } else { std::cout << std::endl; }
             return 0;
         }
-
         if (is_count) {
             std::vector<unsigned char> table_page(page_size);
             std::streamoff root_offset = static_cast<std::streamoff>((rootpage - 1) * static_cast<uint64_t>(page_size));
@@ -354,8 +434,6 @@ int main(int argc, char* argv[]) {
             std::cout << row_count << std::endl;
             return 0;
         }
-
-        // Parse column order from CREATE TABLE
         std::vector<std::string> column_names;
         {
             std::string sql = create_sql;
@@ -386,12 +464,9 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-
-        // Map requested select columns to column indices
         std::vector<size_t> target_col_indices;
         target_col_indices.reserve(select_cols_upper.size());
         for (std::string col : select_cols_upper) {
-            // Strip optional quotes/backticks
             if (!col.empty() && (col.front() == '"' || col.front() == '\'' || col.front() == '`')) {
                 if (col.size() >= 2) {
                     col = col.substr(1, col.size() - 2);
@@ -403,86 +478,21 @@ int main(int argc, char* argv[]) {
                 if (column_names[i] == col) { idx = i; break; }
             }
             if (idx == std::string::npos) {
-                // Unknown column, print nothing
                 std::cout << std::endl;
                 return 0;
             }
             target_col_indices.push_back(idx);
         }
-
-        // Read table page and print requested columns for each row, joined by '|'
-        std::vector<unsigned char> table_page(page_size);
-        std::streamoff root_offset = static_cast<std::streamoff>((rootpage - 1) * static_cast<uint64_t>(page_size));
-        database_file.seekg(root_offset);
-        database_file.read(reinterpret_cast<char*>(table_page.data()), table_page.size());
-        size_t page_header_offset = (rootpage == 1 ? 100 : 0);
-        unsigned char tflags = table_page[page_header_offset + 0];
-        size_t t_btree_header_size = (tflags == 0x0D) ? 8 : ((tflags == 0x05) ? 12 : 8);
-        unsigned short t_num_cells = static_cast<unsigned short>((table_page[page_header_offset + 3] << 8) | table_page[page_header_offset + 4]);
-        size_t t_cell_ptr_array_offset = page_header_offset + t_btree_header_size;
-
-        for (unsigned short i = 0; i < t_num_cells; ++i) {
-            size_t ptr_pos = t_cell_ptr_array_offset + (i * 2);
-            unsigned short cell_offset = static_cast<unsigned short>((table_page[ptr_pos] << 8) | table_page[ptr_pos + 1]);
-
-            size_t p = cell_offset;
-            auto [payload_size, payload_size_len] = readVarint(table_page, p);
-            p += payload_size_len;
-            auto [__, rowid_len2] = readVarint(table_page, p);
-            p += rowid_len2;
-
-            size_t record_start = p;
-            auto [header_size, header_size_len] = readVarint(table_page, record_start);
-            size_t header_varints_pos = record_start + header_size_len;
-            size_t header_end = record_start + static_cast<size_t>(header_size);
-
-            std::vector<uint64_t> serial_types;
-            size_t hp = header_varints_pos;
-            while (hp < header_end) {
-                auto [st, st_len] = readVarint(table_page, hp);
-                serial_types.push_back(st);
-                hp += st_len;
+        size_t where_col_idx = std::string::npos;
+        if (has_where) {
+            for (size_t i = 0; i < column_names.size(); ++i) {
+                if (column_names[i] == where_col_upper) { where_col_idx = i; break; }
             }
-
-            // Precompute body lengths and offsets (prefix sums)
-            std::vector<size_t> col_lengths(serial_types.size());
-            for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
-            std::vector<size_t> col_offsets(serial_types.size());
-            size_t acc = 0;
-            for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
-
-            size_t body_pos = header_end;
-
-            // WHERE filtering (only equals on text for this stage)
-            if (has_where) {
-                // Determine where column index
-                size_t where_col_idx = std::string::npos;
-                for (size_t k = 0; k < column_names.size(); ++k) {
-                    if (column_names[k] == where_col_upper) { where_col_idx = k; break; }
-                }
-                if (where_col_idx == std::string::npos) continue; // unknown column
-                size_t w_start = body_pos + (where_col_idx < col_offsets.size() ? col_offsets[where_col_idx] : 0);
-                size_t w_len = (where_col_idx < col_lengths.size() ? col_lengths[where_col_idx] : 0);
-                std::string wval;
-                wval.reserve(w_len);
-                for (size_t b = 0; b < w_len; ++b) wval.push_back(static_cast<char>(table_page[w_start + b]));
-                if (wval != where_value) continue; // filter out non-matching rows
+            if (where_col_idx == std::string::npos) {
+                return 0;
             }
-
-            // Output selected columns
-            for (size_t j = 0; j < target_col_indices.size(); ++j) {
-                size_t col_idx = target_col_indices[j];
-                size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
-                size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
-                std::string out;
-                out.reserve(len);
-                for (size_t b = 0; b < len; ++b) out.push_back(static_cast<char>(table_page[start + b]));
-                if (j > 0) std::cout << '|';
-                std::cout << out;
-            }
-            std::cout << std::endl;
         }
+        traverseTableBtree(database_file, page_size, static_cast<uint32_t>(rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value);
     }
-
     return 0;
 }
