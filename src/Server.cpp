@@ -34,6 +34,17 @@ int main(int argc, char* argv[]) {
         unsigned short page_size = (static_cast<unsigned char>(buffer[1]) | (static_cast<unsigned char>(buffer[0]) << 8));
         
         std::cout << "database page size: " << page_size << std::endl;
+
+        // Read number of cells on the sqlite_schema page (page 1)
+        // The b-tree page header starts immediately after the 100-byte file header.
+        // The 2-byte big-endian cell count is located at offset 3 within the b-tree page header.
+        database_file.seekg(100 + 3);
+        char cell_count_bytes[2];
+        database_file.read(cell_count_bytes, 2);
+        unsigned short number_of_tables = (static_cast<unsigned char>(cell_count_bytes[1]) |
+                                           (static_cast<unsigned char>(cell_count_bytes[0]) << 8));
+
+        std::cout << "number of tables: " << number_of_tables << std::endl;
     }
 
     return 0;
