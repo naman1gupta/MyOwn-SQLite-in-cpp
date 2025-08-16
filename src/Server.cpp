@@ -51,6 +51,11 @@ static size_t serialTypePayloadLength(uint64_t serial_type_code) {
     }
 }
 
+static std::string rstrip_semicolon(const std::string& s) {
+    if (!s.empty() && s.back() == ';') return s.substr(0, s.size() - 1);
+    return s;
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -182,6 +187,108 @@ int main(int argc, char* argv[]) {
             std::cout << table_names[i];
         }
         std::cout << std::endl;
+    } else if (command.rfind("SELECT", 0) == 0) {
+        // Extract table name by splitting on spaces and picking last token
+        size_t last_space = command.find_last_of(' ');
+        std::string table_name = (last_space == std::string::npos) ? command : command.substr(last_space + 1);
+        table_name = rstrip_semicolon(table_name);
+
+        std::ifstream database_file(database_file_path, std::ios::binary);
+        if (!database_file) {
+            std::cerr << "Failed to open the database file" << std::endl;
+            return 1;
+        }
+
+        // Read page size
+        database_file.seekg(16);
+        char ps_bytes[2];
+        database_file.read(ps_bytes, 2);
+        unsigned short page_size = (static_cast<unsigned char>(ps_bytes[1]) | (static_cast<unsigned char>(ps_bytes[0]) << 8));
+
+        // Read sqlite_schema page (page 1)
+        database_file.seekg(0);
+        std::vector<unsigned char> schema_page(page_size);
+        database_file.read(reinterpret_cast<char*>(schema_page.data()), schema_page.size());
+
+        // Parse schema page header
+        unsigned char flags = schema_page[100];
+        size_t btree_header_size = (flags == 0x0D) ? 8 : ((flags == 0x05) ? 12 : 8);
+        unsigned short num_cells = static_cast<unsigned short>((schema_page[100 + 3] << 8) | schema_page[100 + 4]);
+        size_t cell_ptr_array_offset = 100 + btree_header_size;
+
+        // Find rootpage for the requested table
+        uint64_t rootpage = 0;
+        for (unsigned short i = 0; i < num_cells; ++i) {
+            size_t ptr_pos = cell_ptr_array_offset + (i * 2);
+            unsigned short cell_offset = static_cast<unsigned short>((schema_page[ptr_pos] << 8) | schema_page[ptr_pos + 1]);
+
+            size_t p = cell_offset;
+            auto [payload_size, payload_size_len] = readVarint(schema_page, p);
+            p += payload_size_len;
+            auto [/*rowid*/_, rowid_len] = readVarint(schema_page, p);
+            p += rowid_len;
+
+            size_t record_start = p;
+            auto [header_size, header_size_len] = readVarint(schema_page, record_start);
+            size_t header_varints_pos = record_start + header_size_len;
+            size_t header_end = record_start + static_cast<size_t>(header_size);
+
+            std::vector<uint64_t> serial_types;
+            size_t hp = header_varints_pos;
+            while (hp < header_end) {
+                auto [st, st_len] = readVarint(schema_page, hp);
+                serial_types.push_back(st);
+                hp += st_len;
+            }
+
+            size_t body_pos = header_end;
+
+            // Column indices in sqlite_schema: 0 type, 1 name, 2 tbl_name, 3 rootpage, 4 sql
+            // Extract tbl_name to match
+            size_t tbl_index = 2;
+            size_t body_offset = 0;
+            for (size_t col_index = 0; col_index < tbl_index && col_index < serial_types.size(); ++col_index) {
+                body_offset += serialTypePayloadLength(serial_types[col_index]);
+            }
+            size_t tbl_len = serialTypePayloadLength(serial_types.size() > tbl_index ? serial_types[tbl_index] : 0);
+            std::string tbl;
+            tbl.reserve(tbl_len);
+            size_t tbl_start = body_pos + body_offset;
+            for (size_t j = 0; j < tbl_len; ++j) tbl.push_back(static_cast<char>(schema_page[tbl_start + j]));
+
+            if (tbl == table_name) {
+                // Extract rootpage at column index 3
+                size_t root_index = 3;
+                size_t body_offset2 = 0;
+                for (size_t col_index = 0; col_index < root_index && col_index < serial_types.size(); ++col_index) {
+                    body_offset2 += serialTypePayloadLength(serial_types[col_index]);
+                }
+                size_t root_len = serialTypePayloadLength(serial_types.size() > root_index ? serial_types[root_index] : 0);
+                size_t root_start = body_pos + body_offset2;
+                uint64_t root_val = 0;
+                for (size_t j = 0; j < root_len; ++j) {
+                    root_val = (root_val << 8) | schema_page[root_start + j];
+                }
+                rootpage = root_val;
+                break;
+            }
+        }
+
+        // If not found, print 0
+        if (rootpage == 0) {
+            std::cout << 0 << std::endl;
+            return 0;
+        }
+
+        // Read the root page of the target table
+        std::vector<unsigned char> table_page(page_size);
+        std::streamoff root_offset = static_cast<std::streamoff>((rootpage - 1) * static_cast<uint64_t>(page_size));
+        database_file.seekg(root_offset);
+        database_file.read(reinterpret_cast<char*>(table_page.data()), table_page.size());
+
+        // Count cells (rows) on the leaf table page
+        unsigned short row_count = static_cast<unsigned short>((table_page[100 + 3] << 8) | table_page[100 + 4]);
+        std::cout << row_count << std::endl;
     }
 
     return 0;
