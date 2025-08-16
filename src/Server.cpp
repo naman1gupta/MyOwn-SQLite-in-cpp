@@ -221,7 +221,7 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
                                    size_t index_col_count,
                                    const std::string& where_value,
                                    std::vector<uint64_t>& out_rowids) {
-    if (out_rowids.size() > 100) return;
+    if (out_rowids.size() > 1000) return;
     
     std::vector<unsigned char> page(page_size);
     std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
@@ -840,18 +840,15 @@ int main(int argc, char* argv[]) {
         }
         if (has_where && index_rootpage != 0) {
             std::vector<uint64_t> rowids;
-            rowids.reserve(10);
+            rowids.reserve(1000);
             collectRowidsFromIndex(database_file, page_size, static_cast<uint32_t>(index_rootpage), index_col_count, where_value, rowids);
             
             if (rowids.empty()) {
                 return 0;
             }
             
-            size_t count = 0;
             for (uint64_t rowid : rowids) {
-                if (count >= 5) break;
                 fetchRowByRowId(database_file, page_size, static_cast<uint32_t>(table_rootpage), rowid, target_col_indices, rowid_alias_index);
-                count++;
             }
             return 0;
         }
