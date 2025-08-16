@@ -9,6 +9,7 @@
 #include <cctype>
 #include <functional>
 #include <set>
+#include <unordered_map>
 
 static std::pair<uint64_t, size_t> readVarint(const std::vector<unsigned char>& data, size_t start_index) {
     uint64_t value = 0;
@@ -115,6 +116,84 @@ static std::string decodeValueToString(const std::vector<unsigned char>& buf, si
             }
         }
     }
+}
+
+static std::unordered_map<uint32_t, std::vector<unsigned char>> g_pageCache;
+
+static const std::vector<unsigned char>& getPage(std::ifstream& file, unsigned short page_size, uint32_t page_number) {
+    auto it = g_pageCache.find(page_number);
+    if (it != g_pageCache.end()) return it->second;
+    std::vector<unsigned char> page(page_size);
+    std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
+    file.seekg(offset);
+    file.read(reinterpret_cast<char*>(page.data()), page.size());
+    auto res = g_pageCache.emplace(page_number, std::move(page));
+    return res.first->second;
+}
+
+static size_t headerOffsetFor(uint32_t page_number) {
+    return (page_number == 1 ? 100 : 0);
+}
+
+static uint16_t readBE16(const std::vector<unsigned char>& p, size_t pos) {
+    return static_cast<uint16_t>((p[pos] << 8) | p[pos + 1]);
+}
+
+static uint32_t readBE32(const std::vector<unsigned char>& p, size_t pos) {
+    return (static_cast<uint32_t>(p[pos]) << 24) | (static_cast<uint32_t>(p[pos + 1]) << 16) | (static_cast<uint32_t>(p[pos + 2]) << 8) | static_cast<uint32_t>(p[pos + 3]);
+}
+
+static uint64_t getLeafRowidAt(const std::vector<unsigned char>& page, size_t header_off, size_t cell_index) {
+    uint16_t num_cells = readBE16(page, header_off + 3);
+    size_t cell_ptr_array_off = header_off + 8;
+    size_t ptr_pos = cell_ptr_array_off + cell_index * 2;
+    uint16_t cell_off = readBE16(page, ptr_pos);
+    size_t p = cell_off;
+    auto pr = readVarint(page, p);
+    p += pr.second;
+    pr = readVarint(page, p);
+    return pr.first;
+}
+
+static int64_t lowerBoundLeafByRowid(const std::vector<unsigned char>& page, size_t header_off, uint64_t target_rowid) {
+    uint16_t num_cells = readBE16(page, header_off + 3);
+    int64_t lo = 0, hi = static_cast<int64_t>(num_cells) - 1, ans = num_cells;
+    while (lo <= hi) {
+        int64_t mid = (lo + hi) / 2;
+        uint64_t rid = getLeafRowidAt(page, header_off, static_cast<size_t>(mid));
+        if (rid >= target_rowid) {
+            ans = mid;
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return ans;
+}
+
+static uint64_t getInteriorKeyAt(const std::vector<unsigned char>& page, size_t header_off, size_t cell_index) {
+    size_t cell_ptr_array_off = header_off + 12;
+    size_t ptr_pos = cell_ptr_array_off + cell_index * 2;
+    uint16_t cell_off = readBE16(page, ptr_pos);
+    size_t p = cell_off + 4;
+    auto pr = readVarint(page, p);
+    return pr.first;
+}
+
+static int64_t firstChildIntersectingRange(const std::vector<unsigned char>& page, size_t header_off, uint64_t min_rowid) {
+    uint16_t num_cells = readBE16(page, header_off + 3);
+    int64_t lo = 0, hi = static_cast<int64_t>(num_cells) - 1, ans = num_cells; 
+    while (lo <= hi) {
+        int64_t mid = (lo + hi) / 2;
+        uint64_t key = getInteriorKeyAt(page, header_off, static_cast<size_t>(mid));
+        if (min_rowid <= key) {
+            ans = mid;
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return ans;
 }
 
 static bool fetchRowByRowId(std::ifstream& database_file,
@@ -288,7 +367,6 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
             unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
             size_t p = cell_offset;
             auto pr = readVarint(page, p);
-            uint64_t payload_size = pr.first;
             p += pr.second;
             
             size_t record_start = p;
@@ -770,7 +848,7 @@ int main(int argc, char* argv[]) {
                 serial_types.push_back(stp.first);
                 hp += stp.second;
             }
-            size_t body_pos = header_end;
+            size_t body_pos = record_start + header_size;
             size_t type_index = 0;
             size_t name_index = 1;
             size_t tbl_index = 2;
@@ -786,11 +864,11 @@ int main(int argc, char* argv[]) {
             off0 = 0;
             for (size_t col_index = 0; col_index < tbl_index && col_index < serial_types.size(); ++col_index) off0 += serialTypePayloadLength(serial_types[col_index]);
             size_t tbl_len = serialTypePayloadLength(serial_types.size() > tbl_index ? serial_types[tbl_index] : 0);
-            std::string tbl;
-            tbl.reserve(tbl_len);
-            size_t tbl_start = body_pos + off0;
-            for (size_t j = 0; j < tbl_len; ++j) tbl.push_back(static_cast<char>(schema_page[tbl_start + j]));
-            if (to_upper(typ) == "INDEX" && tbl == table_name) {
+            std::string tbl2;
+            tbl2.reserve(tbl_len);
+            size_t tbl_start2 = body_pos + off0;
+            for (size_t j = 0; j < tbl_len; ++j) tbl2.push_back(static_cast<char>(schema_page[tbl_start2 + j]));
+            if (to_upper(typ) == "INDEX" && tbl2 == table_name) {
                 size_t off3 = 0;
                 for (size_t col_index = 0; col_index < sql_index && col_index < serial_types.size(); ++col_index) off3 += serialTypePayloadLength(serial_types[col_index]);
                 size_t sql_len = serialTypePayloadLength(serial_types.size() > sql_index ? serial_types[sql_index] : 0);
@@ -840,231 +918,178 @@ int main(int argc, char* argv[]) {
         if (has_where && index_rootpage != 0) {
             std::vector<uint64_t> rowids;
             rowids.reserve(1000);
-            
+            // Efficient index traversal with caching
             std::function<void(uint32_t)> collectRowidsFromIndexEfficient = [&](uint32_t page_number) {
                 if (rowids.size() > 5) return;
-                
-                std::vector<unsigned char> page(page_size);
-                std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
-                database_file.seekg(offset);
-                database_file.read(reinterpret_cast<char*>(page.data()), page.size());
-                size_t header_offset = (page_number == 1 ? 100 : 0);
-                unsigned char flags = page[header_offset + 0];
-                
-                if (flags == 0x02) {
-                    unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
-                    size_t cell_ptr_array_offset = header_offset + 12;
-                    
-                    std::vector<uint32_t> pages_to_explore;
-                    bool found_greater = false;
-                    
-                    for (unsigned short i = 0; i < num_cells; ++i) {
-                        size_t ptr_pos = cell_ptr_array_offset + (i * 2);
-                        unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
-                        uint32_t left_child = (static_cast<uint32_t>(page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(page[cell_offset + 2]) << 8) | static_cast<uint32_t>(page[cell_offset + 3]);
-                        
-                        size_t p = cell_offset + 4;
-                        auto pr = readVarint(page, p);
-                        p += pr.second;
-                        
-                        size_t record_start = p;
-                        pr = readVarint(page, record_start);
-                        uint64_t header_size = pr.first;
-                        size_t header_size_len = pr.second;
-                        size_t header_varints_pos = record_start + header_size_len;
-                        size_t header_end = record_start + static_cast<size_t>(header_size);
-                        
-                        std::vector<uint64_t> serial_types;
-                        size_t hp = header_varints_pos;
-                        while (hp < header_end) {
-                            auto t = readVarint(page, hp);
-                            serial_types.push_back(t.first);
-                            hp += t.second;
-                        }
-                        
-                        size_t body_pos = header_end;
-                        size_t country_len = serial_types.empty() ? 0 : serialTypePayloadLength(serial_types[0]);
-                        std::string country_val;
-                        country_val.reserve(country_len);
-                        for (size_t j = 0; j < country_len; ++j) {
-                            country_val.push_back(static_cast<char>(page[body_pos + j]));
-                        }
-                        
-                        int comparison = where_value.compare(country_val);
-                        if (comparison < 0) {
-                            pages_to_explore.push_back(left_child);
-                            found_greater = true;
-                            break;
-                        } else if (comparison == 0) {
-                            pages_to_explore.push_back(left_child);
-                        }
-                    }
-                    
-                    if (!found_greater) {
-                        uint32_t right_child = (static_cast<uint32_t>(page[header_offset + 8]) << 24) | (static_cast<uint32_t>(page[header_offset + 9]) << 16) | (static_cast<uint32_t>(page[header_offset + 10]) << 8) | static_cast<uint32_t>(page[header_offset + 11]);
-                        pages_to_explore.push_back(right_child);
-                    }
-                    
-                    for (uint32_t next_page : pages_to_explore) {
-                        collectRowidsFromIndexEfficient(next_page);
-                    }
-                    
-                } else if (flags == 0x0A) {
-                    unsigned short num_cells = static_cast<unsigned short>((page[header_offset + 3] << 8) | page[header_offset + 4]);
-                    size_t cell_ptr_array_offset = header_offset + 8;
-                    
-                    for (unsigned short i = 0; i < num_cells; ++i) {
+                const auto& page = getPage(database_file, page_size, page_number);
+                size_t header_off = headerOffsetFor(page_number);
+                unsigned char pflags = page[header_off + 0];
+                if (pflags == 0x02) {
+                    uint16_t num_cells2 = readBE16(page, header_off + 3);
+                    size_t cell_ptr = header_off + 12;
+                    std::vector<uint32_t> to_explore;
+                    bool foundGreater = false;
+                    int64_t iStart = 0;
+                    for (int64_t i = iStart; i < num_cells2; ++i) {
                         if (rowids.size() > 5) return;
-                        
-                        size_t ptr_pos = cell_ptr_array_offset + (i * 2);
-                        unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
-                        size_t p = cell_offset;
+                        uint16_t cell_off = readBE16(page, cell_ptr + i * 2);
+                        uint32_t left_child = readBE32(page, cell_off + 0);
+                        size_t p = cell_off + 4;
                         auto pr = readVarint(page, p);
                         p += pr.second;
-                        
-                        size_t record_start = p;
-                        pr = readVarint(page, record_start);
-                        uint64_t header_size = pr.first;
-                        size_t header_size_len = pr.second;
-                        size_t header_varints_pos = record_start + header_size_len;
-                        size_t header_end = record_start + static_cast<size_t>(header_size);
-                        
-                        std::vector<uint64_t> serial_types;
-                        size_t hp = header_varints_pos;
-                        while (hp < header_end) {
-                            auto t = readVarint(page, hp);
-                            serial_types.push_back(t.first);
-                            hp += t.second;
+                        size_t rec_start = p;
+                        pr = readVarint(page, rec_start);
+                        uint64_t hsize = pr.first;
+                        size_t hlen = pr.second;
+                        size_t hpos = rec_start + hlen;
+                        size_t hend = rec_start + static_cast<size_t>(hsize);
+                        std::vector<uint64_t> st;
+                        size_t hp = hpos;
+                        while (hp < hend) { auto t = readVarint(page, hp); st.push_back(t.first); hp += t.second; }
+                        size_t bpos = hend;
+                        size_t first_len = st.empty() ? 0 : serialTypePayloadLength(st[0]);
+                        std::string first_val;
+                        first_val.reserve(first_len);
+                        for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(page[bpos + j]));
+                        int cmp = where_value.compare(first_val);
+                        if (cmp < 0) {
+                            to_explore.push_back(left_child);
+                            foundGreater = true;
+                            break;
+                        } else if (cmp == 0) {
+                            to_explore.push_back(left_child);
                         }
-                        
-                        size_t body_pos = header_end;
-                        size_t country_len = serial_types.empty() ? 0 : serialTypePayloadLength(serial_types[0]);
-                        std::string country_val;
-                        country_val.reserve(country_len);
-                        for (size_t j = 0; j < country_len; ++j) {
-                            country_val.push_back(static_cast<char>(page[body_pos + j]));
-                        }
-                        
-                        if (country_val == where_value) {
-                            size_t rowid_offset = body_pos + country_len;
-                            auto rv = readVarint(page, rowid_offset);
+                    }
+                    if (!foundGreater) {
+                        uint32_t right_child = readBE32(page, header_off + 8);
+                        to_explore.push_back(right_child);
+                    }
+                    for (auto nxt : to_explore) collectRowidsFromIndexEfficient(nxt);
+                } else if (pflags == 0x0A) {
+                    uint16_t num_cells2 = readBE16(page, header_off + 3);
+                    size_t cell_ptr = header_off + 8;
+                    for (uint16_t i = 0; i < num_cells2; ++i) {
+                        if (rowids.size() > 5) return;
+                        uint16_t cell_off = readBE16(page, cell_ptr + i * 2);
+                        size_t p = cell_off;
+                        auto pr = readVarint(page, p);
+                        p += pr.second;
+                        size_t rec_start = p;
+                        pr = readVarint(page, rec_start);
+                        uint64_t hsize = pr.first;
+                        size_t hlen = pr.second;
+                        size_t hpos = rec_start + hlen;
+                        size_t hend = rec_start + static_cast<size_t>(hsize);
+                        std::vector<uint64_t> st;
+                        size_t hp = hpos;
+                        while (hp < hend) { auto t = readVarint(page, hp); st.push_back(t.first); hp += t.second; }
+                        size_t bpos = hend;
+                        size_t first_len = st.empty() ? 0 : serialTypePayloadLength(st[0]);
+                        std::string first_val;
+                        first_val.reserve(first_len);
+                        for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(page[bpos + j]));
+                        if (first_val == where_value) {
+                            size_t rowid_pos = bpos + first_len;
+                            auto rv = readVarint(page, rowid_pos);
                             rowids.push_back(rv.first);
                         }
                     }
                 }
             };
-            
             collectRowidsFromIndexEfficient(static_cast<uint32_t>(index_rootpage));
-            
-            if (rowids.empty()) {
-                return 0;
-            }
-            
+            if (rowids.empty()) return 0;
             std::sort(rowids.begin(), rowids.end());
             rowids.erase(std::unique(rowids.begin(), rowids.end()), rowids.end());
-            
             size_t results_count = 0;
-            for (uint64_t rowid : rowids) {
-                if (results_count >= 1) break;
-                
-                std::function<bool(uint32_t)> findAndPrintRow = [&](uint32_t page_num) -> bool {
-                    std::vector<unsigned char> table_page(page_size);
-                    std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_num) - 1) * static_cast<uint64_t>(page_size));
-                    database_file.seekg(offset);
-                    database_file.read(reinterpret_cast<char*>(table_page.data()), table_page.size());
-                    size_t header_offset = (page_num == 1 ? 100 : 0);
-                    unsigned char flags = table_page[header_offset + 0];
-                    
-                    if (flags == 0x05) {
-                        unsigned short num_cells = static_cast<unsigned short>((table_page[header_offset + 3] << 8) | table_page[header_offset + 4]);
-                        size_t cell_ptr_array_offset = header_offset + 12;
-                        
-                        bool found_greater = false;
-                        for (unsigned short i = 0; i < num_cells; ++i) {
-                            size_t ptr_pos = cell_ptr_array_offset + (i * 2);
-                            unsigned short cell_offset = static_cast<unsigned short>((table_page[ptr_pos] << 8) | table_page[ptr_pos + 1]);
-                            uint32_t left_child = (static_cast<uint32_t>(table_page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(table_page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(table_page[cell_offset + 2]) << 8) | static_cast<uint32_t>(table_page[cell_offset + 3]);
-                            size_t p = cell_offset + 4;
-                            auto pr = readVarint(table_page, p);
-                            uint64_t key_rowid = pr.first;
-                            
-                            if (rowid <= key_rowid) {
-                                if (findAndPrintRow(left_child)) return true;
-                                found_greater = true;
-                                break;
-                            }
-                        }
-                        
-                        if (!found_greater) {
-                            uint32_t right_child = (static_cast<uint32_t>(table_page[header_offset + 8]) << 24) | (static_cast<uint32_t>(table_page[header_offset + 9]) << 16) | (static_cast<uint32_t>(table_page[header_offset + 10]) << 8) | static_cast<uint32_t>(table_page[header_offset + 11]);
-                            return findAndPrintRow(right_child);
-                        }
-                        
-                    } else if (flags == 0x0D) {
-                        unsigned short num_cells = static_cast<unsigned short>((table_page[header_offset + 3] << 8) | table_page[header_offset + 4]);
-                        size_t cell_ptr_array_offset = header_offset + 8;
-                        
-                        for (unsigned short i = 0; i < num_cells; ++i) {
-                            size_t ptr_pos = cell_ptr_array_offset + (i * 2);
-                            unsigned short cell_offset = static_cast<unsigned short>((table_page[ptr_pos] << 8) | table_page[ptr_pos + 1]);
-                            size_t p = cell_offset;
-                            auto pr = readVarint(table_page, p);
+            uint64_t min_rowid = rowids.front();
+            uint64_t max_rowid = rowids.back();
+            std::set<uint64_t> rowid_set(rowids.begin(), rowids.end());
+            std::function<bool(uint32_t)> traverseRange = [&](uint32_t page_num) -> bool {
+                if (results_count >= 5) return true;
+                const auto& page = getPage(database_file, page_size, page_num);
+                size_t header_off = headerOffsetFor(page_num);
+                unsigned char pflags = page[header_off + 0];
+                if (pflags == 0x05) {
+                    uint16_t nc = readBE16(page, header_off + 3);
+                    if (nc == 0) {
+                        uint32_t right_child = readBE32(page, header_off + 8);
+                        return traverseRange(right_child);
+                    }
+                    int64_t firstIdx = firstChildIntersectingRange(page, header_off, min_rowid);
+                    int64_t i = (firstIdx == static_cast<int64_t>(nc) ? nc - 1 : firstIdx);
+                    for (; i < nc; ++i) {
+                        if (results_count >= 5) return true;
+                        uint64_t key = getInteriorKeyAt(page, header_off, static_cast<size_t>(i));
+                        if (min_rowid > key) continue;
+                        uint16_t cell_off = readBE16(page, header_off + 12 + i * 2);
+                        uint32_t left_child = readBE32(page, cell_off + 0);
+                        if (traverseRange(left_child)) return true;
+                        if (max_rowid < key) return true;
+                    }
+                    uint32_t right_child = readBE32(page, header_off + 8);
+                    return traverseRange(right_child);
+                } else if (pflags == 0x0D) {
+                    uint16_t nc = readBE16(page, header_off + 3);
+                    if (nc == 0) return false;
+                    int64_t pos = lowerBoundLeafByRowid(page, header_off, min_rowid);
+                    if (pos >= nc) return false;
+                    for (int64_t i = pos; i < nc; ++i) {
+                        if (results_count >= 5) return true;
+                        uint64_t rid = getLeafRowidAt(page, header_off, static_cast<size_t>(i));
+                        if (rid > max_rowid) return true;
+                        if (rowid_set.find(rid) != rowid_set.end()) {
+                            uint16_t cell_off = readBE16(page, header_off + 8 + i * 2);
+                            size_t p = cell_off;
+                            auto pr = readVarint(page, p);
                             p += pr.second;
-                            pr = readVarint(table_page, p);
-                            uint64_t rowid_value = pr.first;
-                            
-                            if (rowid_value == rowid) {
-                                p += pr.second;
-                                size_t record_start = p;
-                                pr = readVarint(table_page, record_start);
-                                uint64_t header_size = pr.first;
-                                size_t header_size_len = pr.second;
-                                size_t header_varints_pos = record_start + header_size_len;
-                                size_t header_end = record_start + static_cast<size_t>(header_size);
-                                
-                                std::vector<uint64_t> serial_types;
-                                size_t hp = header_varints_pos;
-                                while (hp < header_end) {
-                                    auto stp = readVarint(table_page, hp);
-                                    serial_types.push_back(stp.first);
-                                    hp += stp.second;
-                                }
-                                
-                                std::vector<size_t> col_lengths(serial_types.size());
-                                std::vector<size_t> col_offsets(serial_types.size());
-                                size_t acc = 0;
-                                for (size_t k = 0; k < serial_types.size(); ++k) {
-                                    col_lengths[k] = serialTypePayloadLength(serial_types[k]);
-                                    col_offsets[k] = acc;
-                                    acc += col_lengths[k];
-                                }
-                                
-                                size_t body_pos = header_end;
-                                for (size_t j = 0; j < target_col_indices.size(); ++j) {
-                                    size_t col_idx = target_col_indices[j];
-                                    std::string out;
-                                    if (static_cast<ssize_t>(col_idx) == rowid_alias_index) {
-                                        out = std::to_string(static_cast<long long>(rowid_value));
-                                    } else {
-                                        size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
-                                        size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
-                                        out = decodeValueToString(table_page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
-                                    }
-                                    if (j > 0) std::cout << '|';
-                                    std::cout << out;
-                                }
-                                std::cout << std::endl;
-                                return true;
+                            pr = readVarint(page, p);
+                            p += pr.second;
+                            size_t record_start = p;
+                            pr = readVarint(page, record_start);
+                            uint64_t header_size = pr.first;
+                            size_t header_size_len = pr.second;
+                            size_t header_varints_pos = record_start + header_size_len;
+                            size_t header_end = record_start + static_cast<size_t>(header_size);
+                            std::vector<uint64_t> serial_types;
+                            size_t hp = header_varints_pos;
+                            while (hp < header_end) {
+                                auto stp = readVarint(page, hp);
+                                serial_types.push_back(stp.first);
+                                hp += stp.second;
                             }
+                            std::vector<size_t> col_lengths(serial_types.size());
+                            std::vector<size_t> col_offsets(serial_types.size());
+                            size_t acc = 0;
+                            for (size_t k = 0; k < serial_types.size(); ++k) {
+                                col_lengths[k] = serialTypePayloadLength(serial_types[k]);
+                                col_offsets[k] = acc;
+                                acc += col_lengths[k];
+                            }
+                            size_t body_pos = header_end;
+                            for (size_t j = 0; j < target_col_indices.size(); ++j) {
+                                size_t col_idx = target_col_indices[j];
+                                std::string out;
+                                if (static_cast<ssize_t>(col_idx) == rowid_alias_index) {
+                                    out = std::to_string(static_cast<long long>(rid));
+                                } else {
+                                    size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
+                                    size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
+                                    out = decodeValueToString(page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
+                                }
+                                if (j > 0) std::cout << '|';
+                                std::cout << out;
+                            }
+                            std::cout << std::endl;
+                            results_count++;
+                            rowid_set.erase(rid);
+                            if (rowid_set.empty()) return true;
                         }
                     }
                     return false;
-                };
-                
-                if (findAndPrintRow(static_cast<uint32_t>(table_rootpage))) {
-                    results_count++;
                 }
-            }
+                return false;
+            };
+            traverseRange(static_cast<uint32_t>(table_rootpage));
             return 0;
         }
         traverseTableBtree(database_file, page_size, static_cast<uint32_t>(table_rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
