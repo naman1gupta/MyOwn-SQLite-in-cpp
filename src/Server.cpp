@@ -851,6 +851,8 @@ int main(int argc, char* argv[]) {
             uint64_t min_rowid = rowids.front();
             uint64_t max_rowid = rowids.back();
             
+            size_t results_printed = 0;
+            
             std::function<void(uint32_t)> efficientTraverse = [&](uint32_t page_num) {
                 std::vector<unsigned char> page(page_size);
                 std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_num) - 1) * static_cast<uint64_t>(page_size));
@@ -897,7 +899,7 @@ int main(int argc, char* argv[]) {
                         
                         if (rowid_value > max_rowid) break;
                         
-                        if (rowid_set.count(rowid_value)) {
+                        if (rowid_set.count(rowid_value) && results_printed < 1000) {
                             p += pr.second;
                             size_t record_start = p;
                             pr = readVarint(page, record_start);
@@ -930,15 +932,16 @@ int main(int argc, char* argv[]) {
                                 std::string out;
                                 if (static_cast<ssize_t>(col_idx) == rowid_alias_index) {
                                     out = std::to_string(static_cast<long long>(rowid_value));
-                                } else if (col_idx < col_offsets.size()) {
-                                    size_t start = body_pos + col_offsets[col_idx];
-                                    size_t len = col_lengths[col_idx];
-                                    out = decodeValueToString(page, start, serial_types[col_idx], len);
+                                } else {
+                                    size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
+                                    size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
+                                    out = decodeValueToString(page, start, col_idx < serial_types.size() ? serial_types[col_idx] : 0, len);
                                 }
                                 if (j > 0) std::cout << '|';
                                 std::cout << out;
                             }
                             std::cout << std::endl;
+                            results_printed++;
                         }
                     }
                 }
