@@ -836,17 +836,16 @@ int main(int argc, char* argv[]) {
         }
         if (has_where && index_rootpage != 0) {
             std::vector<uint64_t> rowids;
-            rowids.reserve(128);
+            rowids.reserve(1000);
             collectRowidsFromIndex(database_file, page_size, static_cast<uint32_t>(index_rootpage), index_col_count, where_value, rowids);
             
             if (rowids.empty()) {
                 return 0;
             }
             
-            std::sort(rowids.begin(), rowids.end());
             std::set<uint64_t> rowid_set(rowids.begin(), rowids.end());
             
-            std::function<void(uint32_t)> fetchMatchingRows = [&](uint32_t page_num) {
+            std::function<void(uint32_t)> simpleTraverse = [&](uint32_t page_num) {
                 std::vector<unsigned char> table_page(page_size);
                 std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_num) - 1) * static_cast<uint64_t>(page_size));
                 database_file.seekg(offset);
@@ -857,30 +856,18 @@ int main(int argc, char* argv[]) {
                 if (flags == 0x05) {
                     unsigned short num_cells = static_cast<unsigned short>((table_page[hdr_off + 3] << 8) | table_page[hdr_off + 4]);
                     size_t cell_ptr_off = hdr_off + 12;
-                    
                     for (unsigned short i = 0; i < num_cells; ++i) {
                         size_t ptr_pos = cell_ptr_off + (i * 2);
                         unsigned short cell_offset = static_cast<unsigned short>((table_page[ptr_pos] << 8) | table_page[ptr_pos + 1]);
                         uint32_t left_child = (static_cast<uint32_t>(table_page[cell_offset + 0]) << 24) | (static_cast<uint32_t>(table_page[cell_offset + 1]) << 16) | (static_cast<uint32_t>(table_page[cell_offset + 2]) << 8) | static_cast<uint32_t>(table_page[cell_offset + 3]);
-                        size_t p = cell_offset + 4;
-                        auto pr = readVarint(table_page, p);
-                        uint64_t key_rowid = pr.first;
-                        
-                        if (rowids.back() < key_rowid) {
-                            return;
-                        }
-                        if (rowids[0] <= key_rowid) {
-                            fetchMatchingRows(left_child);
-                        }
+                        simpleTraverse(left_child);
                     }
-                    
                     uint32_t right_child = (static_cast<uint32_t>(table_page[hdr_off + 8]) << 24) | (static_cast<uint32_t>(table_page[hdr_off + 9]) << 16) | (static_cast<uint32_t>(table_page[hdr_off + 10]) << 8) | static_cast<uint32_t>(table_page[hdr_off + 11]);
-                    fetchMatchingRows(right_child);
-                    
+                    simpleTraverse(right_child);
+                    return;
                 } else if (flags == 0x0D) {
                     unsigned short num_cells = static_cast<unsigned short>((table_page[hdr_off + 3] << 8) | table_page[hdr_off + 4]);
                     size_t cell_ptr_off = hdr_off + 8;
-                    
                     for (unsigned short i = 0; i < num_cells; ++i) {
                         size_t ptr_pos = cell_ptr_off + (i * 2);
                         unsigned short cell_offset = static_cast<unsigned short>((table_page[ptr_pos] << 8) | table_page[ptr_pos + 1]);
@@ -937,7 +924,7 @@ int main(int argc, char* argv[]) {
                 }
             };
             
-            fetchMatchingRows(static_cast<uint32_t>(table_rootpage));
+            simpleTraverse(static_cast<uint32_t>(table_rootpage));
             return 0;
         }
         traverseTableBtree(database_file, page_size, static_cast<uint32_t>(table_rootpage), column_names, target_col_indices, has_where, where_col_idx, where_value, rowid_alias_index);
