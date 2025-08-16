@@ -194,21 +194,44 @@ int main(int argc, char* argv[]) {
             std::cout << std::endl;
             return 0;
         }
-        std::string select_expr = tokens[1];
-        std::string from_token_upper = to_upper(tokens[2]);
-        size_t from_index = 2;
-        if (from_token_upper != "FROM") {
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                if (to_upper(tokens[i]) == "FROM") { from_index = i; break; }
-            }
+        // Find FROM token position
+        size_t from_index = std::string::npos;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (to_upper(tokens[i]) == "FROM") { from_index = i; break; }
         }
-        if (from_index >= tokens.size() - 1) {
+        if (from_index == std::string::npos || from_index >= tokens.size() - 1) {
             std::cout << std::endl;
             return 0;
         }
+
+        // Build select list string (tokens between SELECT and FROM), then split by ','
+        std::string select_list_str;
+        for (size_t i = 1; i < from_index; ++i) {
+            if (!select_list_str.empty()) select_list_str.push_back(' ');
+            select_list_str += tokens[i];
+        }
+        // Split by comma
+        std::vector<std::string> select_cols_upper;
+        {
+            std::string cur;
+            for (char c : select_list_str) {
+                if (c == ',') {
+                    std::string part = trim(cur);
+                    if (!part.empty()) select_cols_upper.push_back(to_upper(part));
+                    cur.clear();
+                } else {
+                    cur.push_back(c);
+                }
+            }
+            std::string last = trim(cur);
+            if (!last.empty()) select_cols_upper.push_back(to_upper(last));
+        }
+
+        // Table name follows FROM
         std::string table_name = rstrip_semicolon(tokens[from_index + 1]);
 
-        bool is_count = to_upper(select_expr) == "COUNT(*)";
+        // COUNT(*) special-case: only when single select expression equals COUNT(*)
+        bool is_count = (select_cols_upper.size() == 1 && select_cols_upper[0] == "COUNT(*)");
 
         std::ifstream database_file(database_file_path, std::ios::binary);
         if (!database_file) {
@@ -257,6 +280,7 @@ int main(int argc, char* argv[]) {
 
             size_t body_pos = header_end;
 
+            // Extract tbl_name (index 2) and compare
             size_t tbl_index = 2;
             size_t off = 0;
             for (size_t col_index = 0; col_index < tbl_index && col_index < serial_types.size(); ++col_index) off += serialTypePayloadLength(serial_types[col_index]);
@@ -267,6 +291,7 @@ int main(int argc, char* argv[]) {
             for (size_t j = 0; j < tbl_len; ++j) tbl.push_back(static_cast<char>(schema_page[tbl_start + j]));
 
             if (tbl == table_name) {
+                // rootpage at index 3
                 size_t root_index = 3;
                 size_t off2 = 0;
                 for (size_t col_index = 0; col_index < root_index && col_index < serial_types.size(); ++col_index) off2 += serialTypePayloadLength(serial_types[col_index]);
@@ -276,6 +301,7 @@ int main(int argc, char* argv[]) {
                 for (size_t j = 0; j < root_len; ++j) root_val = (root_val << 8) | schema_page[root_start + j];
                 rootpage = root_val;
 
+                // sql at index 4
                 size_t sql_index = 4;
                 size_t off3 = 0;
                 for (size_t col_index = 0; col_index < sql_index && col_index < serial_types.size(); ++col_index) off3 += serialTypePayloadLength(serial_types[col_index]);
@@ -284,7 +310,6 @@ int main(int argc, char* argv[]) {
                 create_sql.clear();
                 create_sql.reserve(sql_len);
                 for (size_t j = 0; j < sql_len; ++j) create_sql.push_back(static_cast<char>(schema_page[sql_start + j]));
-
                 break;
             }
         }
@@ -337,23 +362,30 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        std::string wanted_col = to_upper(select_expr);
-        // Strip optional quotes/backticks if any
-        if (!wanted_col.empty() && (wanted_col.front() == '"' || wanted_col.front() == '\'' || wanted_col.front() == '`')) {
-            wanted_col = wanted_col.substr(1, wanted_col.size() - 2);
-            wanted_col = to_upper(wanted_col);
+        // Map requested select columns to column indices
+        std::vector<size_t> target_col_indices;
+        target_col_indices.reserve(select_cols_upper.size());
+        for (std::string col : select_cols_upper) {
+            // Strip optional quotes/backticks
+            if (!col.empty() && (col.front() == '"' || col.front() == '\'' || col.front() == '`')) {
+                if (col.size() >= 2) {
+                    col = col.substr(1, col.size() - 2);
+                    col = to_upper(col);
+                }
+            }
+            size_t idx = std::string::npos;
+            for (size_t i = 0; i < column_names.size(); ++i) {
+                if (column_names[i] == col) { idx = i; break; }
+            }
+            if (idx == std::string::npos) {
+                // Unknown column, print nothing
+                std::cout << std::endl;
+                return 0;
+            }
+            target_col_indices.push_back(idx);
         }
 
-        size_t target_col_index = std::string::npos;
-        for (size_t i = 0; i < column_names.size(); ++i) {
-            if (column_names[i] == wanted_col) { target_col_index = i; break; }
-        }
-        if (target_col_index == std::string::npos) {
-            std::cout << std::endl;
-            return 0;
-        }
-
-        // Read table page and print the requested column from each row
+        // Read table page and print requested columns for each row, joined by '|'
         std::vector<unsigned char> table_page(page_size);
         std::streamoff root_offset = static_cast<std::streamoff>((rootpage - 1) * static_cast<uint64_t>(page_size));
         database_file.seekg(root_offset);
@@ -387,19 +419,27 @@ int main(int argc, char* argv[]) {
                 hp += st_len;
             }
 
-            size_t body_pos = header_end;
-            size_t body_offset = 0;
-            for (size_t col_index = 0; col_index < target_col_index && col_index < serial_types.size(); ++col_index) {
-                body_offset += serialTypePayloadLength(serial_types[col_index]);
-            }
-            uint64_t col_serial = (target_col_index < serial_types.size()) ? serial_types[target_col_index] : 0;
-            size_t col_len = serialTypePayloadLength(col_serial);
+            // Precompute body lengths and offsets (prefix sums)
+            std::vector<size_t> col_lengths(serial_types.size());
+            for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
+            std::vector<size_t> col_offsets(serial_types.size());
+            size_t acc = 0;
+            for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
 
-            std::string out;
-            out.reserve(col_len);
-            size_t col_start = body_pos + body_offset;
-            for (size_t j = 0; j < col_len; ++j) out.push_back(static_cast<char>(table_page[col_start + j]));
-            std::cout << out << std::endl;
+            size_t body_pos = header_end;
+
+            // Output selected columns
+            for (size_t j = 0; j < target_col_indices.size(); ++j) {
+                size_t col_idx = target_col_indices[j];
+                size_t start = body_pos + (col_idx < col_offsets.size() ? col_offsets[col_idx] : 0);
+                size_t len = (col_idx < col_lengths.size() ? col_lengths[col_idx] : 0);
+                std::string out;
+                out.reserve(len);
+                for (size_t b = 0; b < len; ++b) out.push_back(static_cast<char>(table_page[start + b]));
+                if (j > 0) std::cout << '|';
+                std::cout << out;
+            }
+            std::cout << std::endl;
         }
     }
 
