@@ -221,7 +221,7 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
                                    size_t index_col_count,
                                    const std::string& where_value,
                                    std::vector<uint64_t>& out_rowids) {
-    if (out_rowids.size() > 10000) return;
+    if (out_rowids.size() > 100) return;
     
     std::vector<unsigned char> page(page_size);
     std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
@@ -283,7 +283,7 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
         size_t cell_ptr_array_offset = header_offset + btree_header_size;
         
         for (unsigned short i = 0; i < num_cells; ++i) {
-            if (out_rowids.size() > 10000) return;
+            if (out_rowids.size() > 100) return;
             
             size_t ptr_pos = cell_ptr_array_offset + (i * 2);
             unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
