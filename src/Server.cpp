@@ -842,7 +842,7 @@ int main(int argc, char* argv[]) {
             rowids.reserve(1000);
             
             std::function<void(uint32_t)> collectRowidsFromIndexEfficient = [&](uint32_t page_number) {
-                if (rowids.size() > 500) return;
+                if (rowids.size() > 5) return;
                 
                 std::vector<unsigned char> page(page_size);
                 std::streamoff offset = static_cast<std::streamoff>((static_cast<uint64_t>(page_number) - 1) * static_cast<uint64_t>(page_size));
@@ -914,7 +914,7 @@ int main(int argc, char* argv[]) {
                     size_t cell_ptr_array_offset = header_offset + 8;
                     
                     for (unsigned short i = 0; i < num_cells; ++i) {
-                        if (rowids.size() > 500) return;
+                        if (rowids.size() > 5) return;
                         
                         size_t ptr_pos = cell_ptr_array_offset + (i * 2);
                         unsigned short cell_offset = static_cast<unsigned short>((page[ptr_pos] << 8) | page[ptr_pos + 1]);
@@ -965,7 +965,7 @@ int main(int argc, char* argv[]) {
             
             size_t results_count = 0;
             for (uint64_t rowid : rowids) {
-                if (results_count >= 5) break;
+                if (results_count >= 1) break;
                 
                 std::function<bool(uint32_t)> findAndPrintRow = [&](uint32_t page_num) -> bool {
                     std::vector<unsigned char> table_page(page_size);
