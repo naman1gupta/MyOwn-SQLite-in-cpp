@@ -262,20 +262,23 @@ static void collectRowidsFromIndex(std::ifstream& database_file,
                 size_t hp = header_varints_pos;
                 while (hp < header_end) { auto t = readVarint(page, hp); serial_types.push_back(t.first); hp += t.second; }
                 std::vector<size_t> col_lengths(serial_types.size());
-                for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
-                size_t body_pos = header_end;
-                size_t first_len = serial_types.empty() ? 0 : col_lengths[0];
-                std::string first_val;
-                first_val.reserve(first_len);
-                for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(page[body_pos + j]));
-                if (first_val == where_value) {
-                    size_t total_len = 0;
-                    for (size_t k = 0; k < serial_types.size(); ++k) total_len += col_lengths[k];
-                    size_t rowid_pos = body_pos + total_len;
-                    auto rv = readVarint(page, rowid_pos);
-                    uint64_t rowid_value = rv.first;
-                    out_rowids.push_back(rowid_value);
-                }
+for (size_t k = 0; k < serial_types.size(); ++k) col_lengths[k] = serialTypePayloadLength(serial_types[k]);
+std::vector<size_t> col_offsets(serial_types.size());
+size_t acc = 0;
+for (size_t k = 0; k < serial_types.size(); ++k) { col_offsets[k] = acc; acc += col_lengths[k]; }
+size_t body_pos = header_end;
+size_t first_len = serial_types.empty() ? 0 : col_lengths[0];
+std::string first_val;
+first_val.reserve(first_len);
+for (size_t j = 0; j < first_len; ++j) first_val.push_back(static_cast<char>(page[body_pos + j]));
+if (first_val == where_value) {
+    size_t rowid_col_index = serial_types.empty() ? 0 : (serial_types.size() - 1);
+    size_t start = body_pos + (rowid_col_index < col_offsets.size() ? col_offsets[rowid_col_index] : 0);
+    size_t len = (rowid_col_index < col_lengths.size() ? col_lengths[rowid_col_index] : 0);
+    std::string rowid_str = decodeValueToString(page, start, serial_types[rowid_col_index], len);
+    uint64_t rowid_value = static_cast<uint64_t>(std::stoll(rowid_str));
+    out_rowids.push_back(rowid_value);
+}
             }
             return;
         } else {
