@@ -5,6 +5,8 @@
 #include <string>
 #include <utility>
 #include <cstdint>
+#include <algorithm>
+#include <cctype>
 
 static std::pair<uint64_t, size_t> readVarint(const std::vector<unsigned char>& data, size_t start_index) {
     uint64_t value = 0;
@@ -71,6 +73,8 @@ int main(int argc, char* argv[]) {
 
     std::string database_file_path = argv[1];
     std::string command = argv[2];
+    std::string command_upper = command;
+    std::transform(command_upper.begin(), command_upper.end(), command_upper.begin(), [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
 
     if (command == ".dbinfo") {
         std::ifstream database_file(database_file_path, std::ios::binary);
@@ -187,7 +191,7 @@ int main(int argc, char* argv[]) {
             std::cout << table_names[i];
         }
         std::cout << std::endl;
-    } else if (command.rfind("SELECT", 0) == 0) {
+    } else if (command_upper.rfind("SELECT", 0) == 0) {
         // Extract table name by splitting on spaces and picking last token
         size_t last_space = command.find_last_of(' ');
         std::string table_name = (last_space == std::string::npos) ? command : command.substr(last_space + 1);
