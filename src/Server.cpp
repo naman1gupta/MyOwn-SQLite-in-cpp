@@ -801,27 +801,76 @@ int main(int argc, char* argv[]) {
             std::vector<uint64_t> rowids;
             rowids.reserve(1000);
 
-            // Simple breadth-first approach: collect all rowids from entire index, then filter
-            std::function<void(uint32_t)> collectAllRowidsFromIndex;
-            collectAllRowidsFromIndex = [&](uint32_t page_number) {
+            // Efficient targeted index search - only traverse relevant parts of B-tree
+            std::function<void(uint32_t)> searchIndexForValue;
+            searchIndexForValue = [&](uint32_t page_number) {
                 const auto& page = getPage(database_file, page_size, page_number);
                 size_t header_off = headerOffsetFor(page_number);
                 unsigned char pflags = page[header_off + 0];
+                
                 if (pflags == 0x02) {
-                    // Interior page - recurse to all children
+                    // Interior index page - find relevant children to search
                     uint16_t num_cells = readBE16(page, header_off + 3);
                     size_t cell_ptr = header_off + 12;
+                    
+                    std::vector<uint32_t> children_to_search;
+                    
                     for (uint16_t i = 0; i < num_cells; ++i) {
                         uint16_t cell_off = readBE16(page, cell_ptr + i * 2);
                         uint32_t left_child = readBE32(page, cell_off);
-                        collectAllRowidsFromIndex(left_child);
+                        
+                        // Read the key for this cell
+                        size_t p = cell_off + 4;
+                        auto pr = readVarint(page, p);
+                        p += pr.second;
+                        size_t rec_start = p;
+                        pr = readVarint(page, rec_start);
+                        uint64_t hsize = pr.first;
+                        size_t hlen = pr.second;
+                        size_t hpos = rec_start + hlen;
+                        size_t hend = rec_start + static_cast<size_t>(hsize);
+                        std::vector<uint64_t> st;
+                        size_t hp = hpos;
+                        while (hp < hend && st.size() < 2) { 
+                            auto t = readVarint(page, hp); 
+                            st.push_back(t.first); 
+                            hp += t.second; 
+                        }
+                        size_t bpos = hend;
+                        size_t first_len = st.empty() ? 0 : serialTypePayloadLength(st[0]);
+                        std::string key_val(reinterpret_cast<const char*>(&page[bpos]), first_len);
+                        
+                        // If our target could be in this left child
+                        if (where_value <= key_val) {
+                            children_to_search.push_back(left_child);
+                        }
+                        
+                        // If target is less than this key, no need to check further
+                        if (where_value < key_val) {
+                            break;
+                        }
                     }
-                    uint32_t right_child = readBE32(page, header_off + 8);
-                    collectAllRowidsFromIndex(right_child);
+                    
+                    // If we haven't found a key > target, check rightmost child
+                    if (children_to_search.empty()) {
+                        uint32_t right_child = readBE32(page, header_off + 8);
+                        if (right_child != 0) {
+                            children_to_search.push_back(right_child);
+                        }
+                    }
+                    
+                    // Search identified children (avoid invalid page numbers)
+                    for (uint32_t child : children_to_search) {
+                        if (child > 0 && child != page_number) {
+                            searchIndexForValue(child);
+                        }
+                    }
+                    
                 } else if (pflags == 0x0A) {
-                    // Leaf page - check all entries
+                    // Leaf page - collect matching entries
                     uint16_t num_cells = readBE16(page, header_off + 3);
                     size_t cell_ptr = header_off + 8;
+                    
                     for (uint16_t i = 0; i < num_cells; ++i) {
                         uint16_t cell_off = readBE16(page, cell_ptr + i * 2);
                         size_t p = cell_off;
@@ -835,7 +884,11 @@ int main(int argc, char* argv[]) {
                         size_t hend = rec_start + static_cast<size_t>(hsize);
                         std::vector<uint64_t> st;
                         size_t hp = hpos;
-                        while (hp < hend) { auto t = readVarint(page, hp); st.push_back(t.first); hp += t.second; }
+                        while (hp < hend) { 
+                            auto t = readVarint(page, hp); 
+                            st.push_back(t.first); 
+                            hp += t.second; 
+                        }
                         size_t bpos = hend;
                         size_t first_len = st.empty() ? 0 : serialTypePayloadLength(st[0]);
                         std::string first_val(reinterpret_cast<const char*>(&page[bpos]), first_len);
@@ -857,7 +910,7 @@ int main(int argc, char* argv[]) {
                 }
             };
             
-            collectAllRowidsFromIndex(static_cast<uint32_t>(index_rootpage));
+            searchIndexForValue(static_cast<uint32_t>(index_rootpage));
             if (rowids.empty()) return 0;
             
             // Sort and remove duplicates
